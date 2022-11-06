@@ -47,6 +47,7 @@
 #include <stdio.h>
 #include <inttypes.h>
 #include <sys/types.h>
+#include <netdb.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -2244,6 +2245,27 @@ void rd_kafka_conf_set_open_cb(
     int (*open_cb)(const char *pathname, int flags, mode_t mode, void *opaque));
 #endif
 
+/**
+ * @brief Set address resolution callback.
+ *
+ * The callback is responsible for resolving the hostname \p node and the
+ * service \p service into a list of socket addresses as \p getaddrinfo would.
+ * The \p hints and \p res parameters function as they do for \p getaddrinfo.
+ * The callback's \p opaque argument is the opaque set with
+ * rd_kafka_conf_set_opaque().
+ *
+ * The callback's return value is interpreted as the return value of
+ * \p getaddrinfo. It must be safe to invoke \c freeaddrinfo on \c res.
+ *
+ * @remark The callback will be called from an internal librdkafka thread.
+ */
+RD_EXPORT void
+rd_kafka_conf_set_resolve_cb(rd_kafka_conf_t *conf,
+                             int (*resolve_cb)(const char *node,
+                                               const char *service,
+                                               const struct addrinfo *hints,
+                                               struct addrinfo **res,
+                                               void *opaque));
 
 /**
  * @brief Sets the verification callback of the broker certificate

@@ -154,13 +154,20 @@ const char *rd_addrinfo_prepare(const char *nodesvc, char **node, char **svc) {
 
 
 
-rd_sockaddr_list_t *rd_getaddrinfo(const char *nodesvc,
-                                   const char *defsvc,
-                                   int flags,
-                                   int family,
-                                   int socktype,
-                                   int protocol,
-                                   const char **errstr) {
+rd_sockaddr_list_t *
+rd_getaddrinfo(const char *nodesvc,
+               const char *defsvc,
+               int flags,
+               int family,
+               int socktype,
+               int protocol,
+               int (*resolve_cb)(const char *node,
+                                 const char *service,
+                                 const struct addrinfo *hints,
+                                 struct addrinfo **res,
+                                 void *opaque),
+               void *opaque,
+               const char **errstr) {
         struct addrinfo hints;
         memset(&hints, 0, sizeof(hints));
         hints.ai_family   = family;
@@ -182,7 +189,13 @@ rd_sockaddr_list_t *rd_getaddrinfo(const char *nodesvc,
         if (*svc)
                 defsvc = svc;
 
-        if ((r = getaddrinfo(node, defsvc, &hints, &ais))) {
+        if (resolve_cb) {
+                r = resolve_cb(node, defsvc, &hints, &ais, opaque);
+        } else {
+                r = getaddrinfo(node, defsvc, &hints, &ais);
+        }
+
+        if (r) {
 #ifdef EAI_SYSTEM
                 if (r == EAI_SYSTEM)
 #else
