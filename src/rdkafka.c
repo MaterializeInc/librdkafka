@@ -1494,6 +1494,7 @@ static void rd_kafka_destroy_internal(rd_kafka_t *rk) {
         rd_list_destroy(&rk->additional_brokerlists);
         rd_list_destroy(&rk->wait_decommissioned_brokers);
         rd_list_destroy(&rk->wait_decommissioned_thrds);
+        rd_list_destroy(&rk->rk_reconnect_backoffs);
 
         /* Destroy mock cluster */
         if (rk->rk_mock.cluster)
@@ -2682,6 +2683,7 @@ rd_kafka_t *rd_kafka_new(rd_kafka_type_t type,
         rd_kafka_coord_reqs_init(rk);
         rd_list_init(&rk->wait_decommissioned_thrds, 0, NULL);
         rd_list_init(&rk->wait_decommissioned_brokers, 0, NULL);
+        rd_list_init(&rk->rk_reconnect_backoffs, 0, rd_free);
 
         if (rk->rk_conf.dr_cb || rk->rk_conf.dr_msg_cb)
                 rk->rk_drmode = RD_KAFKA_DR_MODE_CB;

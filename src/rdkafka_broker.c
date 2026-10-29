@@ -2301,6 +2301,11 @@ int rd_kafka_socket_cb_generic(int domain,
  *        Should be called when a connection is made, or all addresses
  *        a broker resolves to has been exhausted without successful connect.
  *
+ *        The backoff fields are only written by the broker thread, they're
+ *        atomics as the main thread reads them when the broker is
+ *        decommissioned by a re-bootstrap sequence, see
+ *        `rd_kafka_broker_reconnect_backoff_save()`.
+ *
  * @locality broker thread
  * @locks none
  */
@@ -2309,25 +2314,27 @@ rd_kafka_broker_update_reconnect_backoff(rd_kafka_broker_t *rkb,
                                          const rd_kafka_conf_t *conf,
                                          rd_ts_t now) {
         int backoff;
+        int backoff_ms = rd_atomic32_get(&rkb->rkb_reconnect_backoff_ms);
 
         /* If last connection attempt was more than reconnect.backoff.max.ms
          * ago, reset the reconnect backoff to the initial
          * reconnect.backoff.ms value. */
-        if (rkb->rkb_ts_reconnect + (conf->reconnect_backoff_max_ms * 1000) <
+        if (rd_atomic64_get(&rkb->rkb_ts_reconnect) +
+                (conf->reconnect_backoff_max_ms * 1000) <
             now)
-                rkb->rkb_reconnect_backoff_ms = conf->reconnect_backoff_ms;
+                backoff_ms = conf->reconnect_backoff_ms;
 
         /* Apply -25%...+50% jitter to next backoff. */
-        backoff = rd_jitter((int)((float)rkb->rkb_reconnect_backoff_ms * 0.75),
-                            (int)((float)rkb->rkb_reconnect_backoff_ms * 1.5));
+        backoff = rd_jitter((int)((float)backoff_ms * 0.75),
+                            (int)((float)backoff_ms * 1.5));
 
         /* Cap to reconnect.backoff.max.ms. */
         backoff = RD_MIN(backoff, conf->reconnect_backoff_max_ms);
 
         /* Set time of next reconnect */
-        rkb->rkb_ts_reconnect         = now + (backoff * 1000);
-        rkb->rkb_reconnect_backoff_ms = RD_MIN(
-            rkb->rkb_reconnect_backoff_ms * 2, conf->reconnect_backoff_max_ms);
+        rd_atomic64_set(&rkb->rkb_ts_reconnect, now + (backoff * 1000));
+        rd_atomic32_set(&rkb->rkb_reconnect_backoff_ms,
+                        RD_MIN(backoff_ms * 2, conf->reconnect_backoff_max_ms));
 }
 
 
@@ -2341,13 +2348,14 @@ rd_kafka_broker_update_reconnect_backoff(rd_kafka_broker_t *rkb,
  */
 
 static RD_INLINE int
-rd_kafka_broker_reconnect_backoff(const rd_kafka_broker_t *rkb, rd_ts_t now) {
+rd_kafka_broker_reconnect_backoff(rd_kafka_broker_t *rkb, rd_ts_t now) {
         rd_ts_t remains;
+        rd_ts_t ts_reconnect = rd_atomic64_get(&rkb->rkb_ts_reconnect);
 
-        if (unlikely(rkb->rkb_ts_reconnect == 0))
+        if (unlikely(ts_reconnect == 0))
                 return 0; /* immediate */
 
-        remains = rkb->rkb_ts_reconnect - now;
+        remains = ts_reconnect - now;
         if (remains <= 0)
                 return 0; /* immediate */
 
@@ -3835,27 +3843,37 @@ rd_kafka_broker_op_serve(rd_kafka_broker_t *rkb, rd_kafka_op_t *rko) {
                             rkb, RD_KAFKA_BROKER_STATE_TRY_CONNECT);
                         rd_kafka_broker_unlock(rkb);
 
-                } else if (rkb->rkb_state >=
-                           RD_KAFKA_BROKER_STATE_TRY_CONNECT) {
-                        rd_bool_t do_disconnect = rd_false;
+                        /* The first connection attempt isn't expedited:
+                         * `rkb_ts_reconnect` is zero already, unless the
+                         * reconnect backoff of a decommissioned broker
+                         * with the same address was inherited, see
+                         * `rd_kafka_broker_reconnect_backoff_inherit()`,
+                         * in which case it must keep pacing the attempts
+                         * across re-bootstrap sequences. */
+                } else {
+                        if (rkb->rkb_state >=
+                            RD_KAFKA_BROKER_STATE_TRY_CONNECT) {
+                                rd_bool_t do_disconnect = rd_false;
 
-                        /* If the nodename was changed since the last connect,
-                         * close the current connection. */
+                                /* If the nodename was changed since the last
+                                 * connect, close the current connection. */
 
-                        rd_kafka_broker_lock(rkb);
-                        do_disconnect =
-                            (rkb->rkb_connect_epoch != rkb->rkb_nodename_epoch);
-                        rd_kafka_broker_unlock(rkb);
+                                rd_kafka_broker_lock(rkb);
+                                do_disconnect = (rkb->rkb_connect_epoch !=
+                                                 rkb->rkb_nodename_epoch);
+                                rd_kafka_broker_unlock(rkb);
 
-                        if (do_disconnect)
-                                rd_kafka_broker_planned_fail(
-                                    rkb, RD_KAFKA_RESP_ERR__TRANSPORT, "%s",
-                                    "Closing connection due to "
-                                    "nodename change");
+                                if (do_disconnect)
+                                        rd_kafka_broker_planned_fail(
+                                            rkb, RD_KAFKA_RESP_ERR__TRANSPORT,
+                                            "%s",
+                                            "Closing connection due to "
+                                            "nodename change");
+                        }
+
+                        /* Expedite next reconnect */
+                        rd_atomic64_set(&rkb->rkb_ts_reconnect, 0);
                 }
-
-                /* Expedite next reconnect */
-                rkb->rkb_ts_reconnect = 0;
 
                 wakeup = rd_true;
                 break;
@@ -5323,6 +5341,108 @@ rd_kafka_broker_t *rd_kafka_broker_internal(rd_kafka_t *rk) {
 
 
 /**
+ * @brief Inherit the reconnect backoff of the configured broker with the
+ *        same address that the last re-bootstrap sequence decommissioned
+ *        while it wasn't connected, if any, so that the connection attempts
+ *        to an unreachable cluster keep being paced by `reconnect.backoff.ms`
+ *        across re-bootstrap sequences, instead of each sequence starting
+ *        over with an immediate attempt: that's about one attempt, and one
+ *        sequence, every `sparse_connect_intvl` while all brokers are down.
+ *
+ *        The saved entry is consumed.
+ *        Must be called before the broker thread is started, so that its
+ *        first reconnect backoff check sees the inherited values.
+ *
+ * @sa rd_kafka_broker_reconnect_backoff_save()
+ *
+ * @locks rd_kafka_wrlock(rk) MUST be held.
+ * @locality any
+ */
+static void rd_kafka_broker_reconnect_backoff_inherit(rd_kafka_broker_t *rkb) {
+        rd_kafka_t *rk = rkb->rkb_rk;
+        rd_kafka_broker_reconnect_backoff_t *rb;
+        int i;
+
+        RD_LIST_FOREACH(rb, &rk->rk_reconnect_backoffs, i) {
+                if (rb->proto != rkb->rkb_proto ||
+                    strcmp(rb->nodename, rkb->rkb_nodename))
+                        continue;
+
+                rd_atomic32_set(&rkb->rkb_reconnect_backoff_ms,
+                                rb->backoff_ms);
+                rd_atomic64_set(&rkb->rkb_ts_reconnect, rb->ts_reconnect);
+
+                rd_rkb_dbg(rkb, BROKER, "RECONNECT",
+                           "Inheriting reconnect backoff of decommissioned "
+                           "broker with the same address: %dms, "
+                           "next connection attempt in %" PRId64 "ms",
+                           rb->backoff_ms,
+                           RD_MAX((int64_t)0,
+                                  (rb->ts_reconnect - rd_clock()) / 1000));
+
+                rd_list_remove_elem(&rk->rk_reconnect_backoffs, i);
+                rd_free(rb);
+                return;
+        }
+}
+
+/**
+ * @brief Save the reconnect backoff of \p rkb , a configured broker about to
+ *        be decommissioned by a re-bootstrap sequence, for the broker object
+ *        re-added with the same address to inherit.
+ *
+ *        Nothing is saved for a connected broker, or one that never tried
+ *        to connect: there's no backoff to continue and its successor
+ *        connects immediately, as before, so the re-bootstrap sequences
+ *        on a reachable cluster (e.g. on `REBOOTSTRAP_REQUIRED` errors)
+ *        aren't delayed.
+ *
+ * @sa rd_kafka_broker_reconnect_backoff_inherit()
+ *
+ * @locks rd_kafka_wrlock(rk) MUST be held.
+ * @locks_acquired rd_kafka_broker_lock()
+ * @locality any
+ */
+static void rd_kafka_broker_reconnect_backoff_save(rd_kafka_t *rk,
+                                                   rd_kafka_broker_t *rkb) {
+        rd_kafka_broker_reconnect_backoff_t *rb;
+        rd_kafka_broker_state_t state;
+        rd_ts_t ts_reconnect;
+
+        if (rkb->rkb_source != RD_KAFKA_CONFIGURED)
+                return;
+
+        ts_reconnect = rd_atomic64_get(&rkb->rkb_ts_reconnect);
+        if (ts_reconnect == 0)
+                return; /* Never tried to connect */
+
+        rd_kafka_broker_lock(rkb);
+        state = rkb->rkb_state;
+        if (state >= RD_KAFKA_BROKER_STATE_UP) {
+                rd_kafka_broker_unlock(rkb);
+                return; /* Connected */
+        }
+
+        rb        = rd_calloc(1, sizeof(*rb));
+        rb->proto = rkb->rkb_proto;
+        rd_strlcpy(rb->nodename, rkb->rkb_nodename, sizeof(rb->nodename));
+        rd_kafka_broker_unlock(rkb);
+
+        rb->backoff_ms   = rd_atomic32_get(&rkb->rkb_reconnect_backoff_ms);
+        rb->ts_reconnect = ts_reconnect;
+
+        rd_rkb_dbg(rkb, BROKER, "RECONNECT",
+                   "Saving reconnect backoff for the broker re-added with "
+                   "the same address: %dms, next connection attempt in "
+                   "%" PRId64 "ms (state %s)",
+                   rb->backoff_ms,
+                   RD_MAX((int64_t)0, (rb->ts_reconnect - rd_clock()) / 1000),
+                   rd_kafka_broker_state_names[state]);
+
+        rd_list_add(&rk->rk_reconnect_backoffs, rb);
+}
+
+/**
  * Adds a broker with refcount set to 1.
  * If 'source' is RD_KAFKA_INTERNAL an internal broker is added
  * that does not actually represent or connect to a real broker, it is used
@@ -5450,7 +5570,11 @@ rd_kafka_broker_t *rd_kafka_broker_add(rd_kafka_t *rk,
         rd_refcnt_init(&rkb->rkb_refcnt, 0);
         rd_kafka_broker_keep(rkb); /* rk_broker's refcount */
 
-        rkb->rkb_reconnect_backoff_ms = rk->rk_conf.reconnect_backoff_ms;
+        rd_atomic32_init(&rkb->rkb_reconnect_backoff_ms,
+                         rk->rk_conf.reconnect_backoff_ms);
+        rd_atomic64_init(&rkb->rkb_ts_reconnect, 0);
+        if (source == RD_KAFKA_CONFIGURED)
+                rd_kafka_broker_reconnect_backoff_inherit(rkb);
         rd_atomic32_init(&rkb->rkb_persistconn.coord, 0);
         rd_atomic32_init(&rkb->termination_in_progress, 0);
         rd_atomic32_init(&rkb->rkb_down_reported, 0);
@@ -6764,6 +6888,7 @@ void rd_kafka_brokers_decommission_non_logical(rd_kafka_t *rk,
                                                const char *reason) {
         rd_kafka_broker_t *rkb;
         rd_list_t brokers_to_decommission;
+        int i;
 
         rd_kafka_wrlock(rk);
         rd_list_init(&brokers_to_decommission,
@@ -6782,6 +6907,17 @@ void rd_kafka_brokers_decommission_non_logical(rd_kafka_t *rk,
                         continue;
 
                 rd_list_add(&brokers_to_decommission, rkb);
+        }
+
+        /* Keep the reconnect backoff of the configured brokers for the
+         * broker objects the re-bootstrap sequence re-adds with the same
+         * address, see `rd_kafka_broker_reconnect_backoff_inherit()`.
+         * The entries left by the previous sequence are dropped first: they
+         * belong to brokers that weren't re-added, e.g. after the canonical
+         * bootstrap names resolved differently. */
+        rd_list_clear(&rk->rk_reconnect_backoffs);
+        RD_LIST_FOREACH(rkb, &brokers_to_decommission, i) {
+                rd_kafka_broker_reconnect_backoff_save(rk, rkb);
         }
 
         if (rd_list_cnt(&brokers_to_decommission) > 0) {
@@ -6806,7 +6942,9 @@ static int rd_ut_reconnect_backoff(void) {
         rd_ts_t now           = 1000000;
         int backoff;
 
-        rkb.rkb_reconnect_backoff_ms = conf.reconnect_backoff_ms;
+        rd_atomic32_init(&rkb.rkb_reconnect_backoff_ms,
+                         conf.reconnect_backoff_ms);
+        rd_atomic64_init(&rkb.rkb_ts_reconnect, 0);
 
         /* broker's backoff is the initial reconnect.backoff.ms=10 */
         rd_kafka_broker_update_reconnect_backoff(&rkb, &conf, now);

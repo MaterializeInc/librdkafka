@@ -1,3 +1,32 @@
+# librdkafka v2.16.1
+
+librdkafka v2.16.1 is a maintenance release:
+
+* Keep the reconnect backoff of a bootstrap broker across re-bootstrap
+  sequences: while all brokers are down, the bootstrap broker re-added by each
+  sequence inherits the backoff of the decommissioned one instead of connecting
+  immediately, so the connection attempts (and the sequences they start) are
+  paced by `reconnect.backoff.ms` up to `reconnect.backoff.max.ms` instead of
+  happening about 20 times a second.
+
+
+## Fixes
+
+### General fixes
+
+* Each re-bootstrap sequence re-added the bootstrap brokers as new broker
+  objects with a fresh reconnect backoff, and while all brokers were down each
+  of their failed connection attempts started a new sequence: the attempts
+  weren't paced by `reconnect.backoff.ms` but by how often a cluster connection
+  was asked for (`sparse_connect_intvl`, 50ms by default). The backoff of a
+  bootstrap broker that isn't connected when it's decommissioned by a sequence
+  is now inherited by the broker object re-added with the same address, and
+  the connection request that selects it doesn't reset it, so the backoff keeps
+  ramping up across sequences. A connected bootstrap broker's successor still
+  connects immediately, so sequences on a reachable cluster aren't delayed.
+
+
+
 # librdkafka v2.16.0
 
 librdkafka v2.16.0 is a feature release:
