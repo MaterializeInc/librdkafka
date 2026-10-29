@@ -290,6 +290,20 @@ static RD_UNUSED const char *rd_kafka_type2str(rd_kafka_type_t type) {
  * Kafka handle, internal representation of the application's rd_kafka_t.
  */
 
+/**
+ * @brief Reconnect backoff of a configured broker decommissioned by a
+ *        re-bootstrap sequence, inherited by the broker object re-added
+ *        with the same address. See `rd_kafka_s.rk_reconnect_backoffs`.
+ */
+typedef struct rd_kafka_broker_reconnect_backoff_s {
+        rd_kafka_secproto_t proto;
+        char nodename[RD_KAFKA_NODENAME_SIZE];
+        /** `rkb_reconnect_backoff_ms` of the decommissioned broker. */
+        int backoff_ms;
+        /** `rkb_ts_reconnect` of the decommissioned broker. */
+        rd_ts_t ts_reconnect;
+} rd_kafka_broker_reconnect_backoff_t;
+
 struct rd_kafka_s {
         rd_kafka_q_t *rk_rep; /* kafka -> application reply queue */
         rd_kafka_q_t *rk_ops; /* any -> rdkafka main thread ops */
@@ -323,6 +337,16 @@ struct rd_kafka_s {
         rd_list_t wait_decommissioned_thrds;
         /** Decommissioned brokers to await */
         rd_list_t wait_decommissioned_brokers;
+        /** Reconnect backoff of the configured (bootstrap) brokers that the
+         *  last re-bootstrap sequence decommissioned while they weren't
+         *  connected, inherited by the broker objects re-added with the
+         *  same address so that the connection attempts to an unreachable
+         *  cluster keep being paced by `reconnect.backoff.ms` across
+         *  sequences, instead of each sequence starting over with an
+         *  immediate attempt.
+         *  Elements are `rd_kafka_broker_reconnect_backoff_t`.
+         *  Protected by rd_kafka_wrlock(). */
+        rd_list_t rk_reconnect_backoffs;
 
         mtx_t rk_internal_rkb_lock;
         rd_kafka_broker_t *rk_internal_rkb;

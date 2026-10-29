@@ -366,11 +366,15 @@ struct rd_kafka_broker_s { /* rd_kafka_broker_t */
                                        * up from IO-wait when
                                        * queues have content. */
 
-        /**< Current, exponentially increased, reconnect backoff. */
-        int rkb_reconnect_backoff_ms;
+        /**< Current, exponentially increased, reconnect backoff.
+         *   Updated by the broker thread, also read by the main thread
+         *   when the broker is decommissioned by a re-bootstrap sequence,
+         *   see `rd_kafka_brokers_decommission_non_logical()`. */
+        rd_atomic32_t rkb_reconnect_backoff_ms;
 
-        /**< Absolute timestamp of next allowed reconnect. */
-        rd_ts_t rkb_ts_reconnect;
+        /**< Absolute timestamp of next allowed reconnect.
+         *   Same access pattern as `rkb_reconnect_backoff_ms`. */
+        rd_atomic64_t rkb_ts_reconnect;
 
         /** Absolute time of last connection attempt. */
         rd_ts_t rkb_ts_connect;
