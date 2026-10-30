@@ -2260,6 +2260,14 @@ static void rd_kafka_rebootstrap_tmr_cb(rd_kafka_timers_t *rkts, void *arg) {
         rd_kafka_dbg(rk, ALL, "REBOOTSTRAP", "Starting re-bootstrap sequence");
 
         rd_atomic32_set(&rk->rk_rebootstrap_in_progress, 1);
+
+        /* Stop any other pending re-bootstrap: this sequence supersedes it,
+         * and its firing later would decommission the brokers re-added
+         * below. Stopping the timer that fired this callback is a no-op. */
+        rd_kafka_rebootstrap_backoff_tmr_stop(rk, "re-bootstrap sequence");
+        rd_kafka_timer_stop(&rk->rk_timers, &rk->rebootstrap_tmr,
+                            rd_true /* lock */);
+
         rd_kafka_reset_any_broker_down_reported(rk);
 
         /* Decommission the learned and the configured (bootstrap) brokers:
@@ -2334,6 +2342,30 @@ static void rd_kafka_rebootstrap_tmr_cb(rd_kafka_timers_t *rkts, void *arg) {
         rd_list_destroy(&additional_brokerlists);
 done:
         rd_atomic32_set(&rk->rk_rebootstrap_in_progress, 0);
+}
+
+/**
+ * @brief Callback of the all-brokers-down re-bootstrap timer.
+ *
+ * Runs the sequence unless a broker connection came up after the timer
+ * fired: its UP path found no timer left to stop, and the sequence would
+ * tear the fresh connection down.
+ *
+ * @locality rdkafka main thread
+ * @locks none
+ */
+static void rd_kafka_rebootstrap_backoff_tmr_cb(rd_kafka_timers_t *rkts,
+                                                void *arg) {
+        rd_kafka_t *rk = rkts->rkts_rk;
+
+        if (rd_atomic32_get(&rk->rk_broker_up_cnt) > 0) {
+                rd_kafka_dbg(rk, ALL, "REBOOTSTRAP",
+                             "Skipping all-brokers-down re-bootstrap: "
+                             "a broker connection is up");
+                return;
+        }
+
+        rd_kafka_rebootstrap_tmr_cb(rkts, arg);
 }
 
 static void rd_kafka_stats_emit_tmr_cb(rd_kafka_timers_t *rkts, void *arg) {
@@ -2660,6 +2692,7 @@ rd_kafka_t *rd_kafka_new(rd_kafka_type_t type,
         rd_atomic32_init(&rk->rk_broker_down_cnt, 0);
         rd_atomic32_init(&rk->rk_rebootstrap_in_progress, 0);
         rd_atomic64_init(&rk->rk_last_all_brokers_down_reported_ts, 0);
+        rd_atomic64_init(&rk->rk_rebootstrap_backoff_ms, 0);
 
         rk->rk_rep             = rd_kafka_q_new(rk);
         rk->rk_ops             = rd_kafka_q_new(rk);
@@ -4567,6 +4600,82 @@ void rd_kafka_rebootstrap(rd_kafka_t *rk) {
 }
 
 /**
+ * Schedules a rebootstrap because all brokers are down, after a backoff
+ * mirroring the broker reconnect backoff: reconnect.backoff.ms with jitter,
+ * doubled per consecutive rebootstrap, capped at reconnect.backoff.max.ms
+ * and reset when a learned broker comes up. Uses its own timer, stopped
+ * when a broker comes up or another sequence starts, and doesn't take part
+ * in rk_rebootstrap_in_progress.
+ *
+ * @locks none
+ * @locks_acquired rd_kafka_timers_lock()
+ * @locality any
+ */
+void rd_kafka_rebootstrap_all_brokers_down(rd_kafka_t *rk) {
+        int64_t prev_backoff_ms;
+        int backoff_ms, delay_ms;
+
+        if (rk->rk_conf.metadata_recovery_strategy ==
+            RD_KAFKA_METADATA_RECOVERY_STRATEGY_NONE)
+                return;
+
+        prev_backoff_ms = rd_atomic64_get(&rk->rk_rebootstrap_backoff_ms);
+        backoff_ms      = (int)prev_backoff_ms;
+        if (backoff_ms == 0)
+                backoff_ms = rk->rk_conf.reconnect_backoff_ms;
+
+        /* Same -25%..+50% jitter as the broker reconnect backoff. */
+        delay_ms = rd_jitter((int)((float)backoff_ms * 0.75),
+                             (int)((float)backoff_ms * 1.5));
+        delay_ms = RD_MIN(delay_ms, rk->rk_conf.reconnect_backoff_max_ms);
+
+        if (!rd_kafka_timer_start_oneshot(
+                &rk->rk_timers, &rk->rebootstrap_backoff_tmr,
+                rd_false /*don't restart*/, (rd_ts_t)delay_ms * 1000,
+                rd_kafka_rebootstrap_backoff_tmr_cb, NULL))
+                /* Already pending, e.g. a broker added in the meantime
+                 * failed too: keep its delay and the backoff it doubled. */
+                return;
+
+        /* A broker may have come up between the all-brokers-down check and
+         * the timer start, when its UP path had no timer to stop yet. It
+         * increments rk_broker_up_cnt before trying, so re-check it. */
+        if (rd_atomic32_get(&rk->rk_broker_up_cnt) > 0) {
+                rd_kafka_rebootstrap_backoff_tmr_stop(
+                    rk, "broker came up while arming");
+                return;
+        }
+
+        /* Double the backoff for the next one, unless a broker came up in
+         * the meantime and reset it: that reset must win, or the next
+         * outage would start from a stale, ramped up, backoff. */
+        rd_atomic64_cas(&rk->rk_rebootstrap_backoff_ms, prev_backoff_ms,
+                        RD_MIN(backoff_ms * 2,
+                               rk->rk_conf.reconnect_backoff_max_ms));
+
+        rd_kafka_dbg(rk, ALL, "REBOOTSTRAP",
+                     "All brokers are down: re-bootstrap in %dms", delay_ms);
+}
+
+/**
+ * Stops a pending all-brokers-down rebootstrap, if any, because a broker
+ * came up or another rebootstrap sequence supersedes it.
+ *
+ * @locks none
+ * @locks_acquired rd_kafka_timers_lock()
+ * @locality any
+ */
+void rd_kafka_rebootstrap_backoff_tmr_stop(rd_kafka_t *rk,
+                                           const char *reason) {
+        if (rd_kafka_timer_stop(&rk->rk_timers, &rk->rebootstrap_backoff_tmr,
+                                rd_true /* lock */))
+                rd_kafka_dbg(rk, ALL, "REBOOTSTRAP",
+                             "Cancelled pending all-brokers-down "
+                             "re-bootstrap: %s",
+                             reason);
+}
+
+/**
  * Starts rebootstrap timer with the configured interval. Only if not
  * started or stopped.
  *
@@ -4589,6 +4698,10 @@ void rd_kafka_rebootstrap_tmr_start_maybe(rd_kafka_t *rk) {
  * Stops rebootstrap timer, for example after a successful metadata response.
  * Releases rk_rebootstrap_in_progress if the stopped timer was a pending
  * immediate rebootstrap, so a later one can be scheduled.
+ *
+ * The all-brokers-down rebootstrap timer is deliberately left alone: the
+ * response may be stale, parsed after every broker went down and armed it,
+ * and only a broker coming up resolves that state.
  *
  * @return 1 if the timer was started (before being stopped), else 0.
  *

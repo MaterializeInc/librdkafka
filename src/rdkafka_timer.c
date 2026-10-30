@@ -167,19 +167,23 @@ rd_bool_t rd_kafka_timer_is_started(rd_kafka_timers_t *rkts,
  * @param restart if timer is already started, restart it.
  *
  * Use rd_kafka_timer_stop() to stop a timer.
+ *
+ * @returns true if the timer was (re)started, false if it was already
+ *          scheduled and \p restart was false.
  */
-void rd_kafka_timer_start0(rd_kafka_timers_t *rkts,
-                           rd_kafka_timer_t *rtmr,
-                           rd_ts_t interval,
-                           rd_bool_t oneshot,
-                           rd_bool_t restart,
-                           void (*callback)(rd_kafka_timers_t *rkts, void *arg),
-                           void *arg) {
+rd_bool_t
+rd_kafka_timer_start0(rd_kafka_timers_t *rkts,
+                      rd_kafka_timer_t *rtmr,
+                      rd_ts_t interval,
+                      rd_bool_t oneshot,
+                      rd_bool_t restart,
+                      void (*callback)(rd_kafka_timers_t *rkts, void *arg),
+                      void *arg) {
         rd_kafka_timers_lock(rkts);
 
         if (!restart && rd_kafka_timer_scheduled(rtmr)) {
                 rd_kafka_timers_unlock(rkts);
-                return;
+                return rd_false;
         }
 
         rd_kafka_timer_stop(rkts, rtmr, 0 /*!lock*/);
@@ -195,6 +199,8 @@ void rd_kafka_timer_start0(rd_kafka_timers_t *rkts,
         rd_kafka_timer_schedule(rkts, rtmr, 0);
 
         rd_kafka_timers_unlock(rkts);
+
+        return rd_true;
 }
 
 /**

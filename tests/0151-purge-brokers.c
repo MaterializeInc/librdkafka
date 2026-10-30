@@ -500,6 +500,18 @@ static rd_atomic32_t
 /** Duration in seconds the only broker is kept down. */
 static int do_test_down_then_up_no_rebootstrap_loop_outage_s;
 
+/** Initial and maximum re-bootstrap backoff (ms). Set explicitly so the
+ *  expectations below don't depend on test.conf. */
+#define DO_TEST_DOWN_THEN_UP_BACKOFF_MS     100
+#define DO_TEST_DOWN_THEN_UP_BACKOFF_MAX_MS 10000
+
+/** Delays (ms) of the all-brokers-down re-bootstraps, in order, parsed from
+ *  the "All brokers are down: re-bootstrap in <N>ms" debug line. */
+#define DO_TEST_DOWN_THEN_UP_MAX_DELAYS 64
+static int do_test_down_then_up_no_rebootstrap_loop_delays_ms
+    [DO_TEST_DOWN_THEN_UP_MAX_DELAYS];
+static rd_atomic32_t do_test_down_then_up_no_rebootstrap_loop_delay_cnt;
+
 /**
  * @brief Error callback that counts the `ALL_BROKERS_DOWN` errors
  *        reported to the application.
@@ -523,17 +535,34 @@ do_test_down_then_up_no_rebootstrap_loop_error_cb(rd_kafka_t *rk,
 }
 
 /**
- * @brief Log callback that counts numer of rebootstrap sequences received.
+ * @brief Log callback that counts the re-bootstrap sequences and records
+ *        the backoff delay of each all-brokers-down re-bootstrap.
  */
 static void
 do_test_down_then_up_no_rebootstrap_loop_log_cb(const rd_kafka_t *rk,
                                                 int level,
                                                 const char *fac,
                                                 const char *buf) {
+        static const char delay_prefix[] =
+            "All brokers are down: re-bootstrap in ";
+        const char *delay_str;
+        int delay_ms;
+
         if (strstr(buf, "Starting re-bootstrap sequence")) {
                 rd_atomic32_add(
                     &do_test_down_then_up_no_rebootstrap_loop_rebootstrap_sequence_cnt,
                     1);
+        } else if ((delay_str = strstr(buf, delay_prefix)) &&
+                   sscanf(delay_str + strlen(delay_prefix), "%dms",
+                          &delay_ms) == 1) {
+                int idx =
+                    rd_atomic32_add(
+                        &do_test_down_then_up_no_rebootstrap_loop_delay_cnt,
+                        1) -
+                    1;
+                if (idx < DO_TEST_DOWN_THEN_UP_MAX_DELAYS)
+                        do_test_down_then_up_no_rebootstrap_loop_delays_ms
+                            [idx] = delay_ms;
         }
 }
 
@@ -545,8 +574,11 @@ do_test_down_then_up_no_rebootstrap_loop_edit_configuration_cb(
     rd_kafka_conf_t *conf) {
         const char *debug_contexts[2] = {"generic", NULL};
 
-        /* Avoid it being changed through test.conf */
-        test_conf_set(conf, "reconnect.backoff.max.ms", "10000");
+        /* Avoid them being changed through test.conf */
+        test_conf_set(conf, "reconnect.backoff.ms",
+                      tsprintf("%d", DO_TEST_DOWN_THEN_UP_BACKOFF_MS));
+        test_conf_set(conf, "reconnect.backoff.max.ms",
+                      tsprintf("%d", DO_TEST_DOWN_THEN_UP_BACKOFF_MAX_MS));
         log_interceptor = test_conf_set_log_interceptor(
             conf, do_test_down_then_up_no_rebootstrap_loop_log_cb,
             debug_contexts);
@@ -588,13 +620,16 @@ do_test_down_then_up_no_rebootstrap_loop_after_action_cb(rd_kafka_t **rkp,
 
 /**
  * @brief Test setting down a broker and then setting it up again.
- *        It shouldn't cause a loop of re-bootstrap sequences.
+ *        It shouldn't cause a loop of re-bootstrap sequences: the
+ *        all-brokers-down re-bootstraps must follow the reconnect backoff.
  *
  * @param outage_s Seconds the broker is kept down.
  */
 static void do_test_down_then_up_no_rebootstrap_loop(int outage_s) {
         int32_t actual_rebootstrap_sequence_cnt, actual_all_brokers_down_cnt;
-        int32_t max_rebootstrap_sequence_cnt, expected_all_brokers_down_cnt;
+        int32_t max_rebootstrap_sequence_cnt, max_all_brokers_down_cnt;
+        int32_t delay_cnt;
+        int backoff_ms, elapsed_ms, i;
         SUB_TEST_QUICK("%ds outage", outage_s);
         do_test_down_then_up_no_rebootstrap_loop_outage_s = outage_s;
         rd_atomic32_init(
@@ -602,12 +637,15 @@ static void do_test_down_then_up_no_rebootstrap_loop(int outage_s) {
             0);
         rd_atomic32_init(
             &do_test_down_then_up_no_rebootstrap_loop_all_brokers_down_cnt, 0);
+        rd_atomic32_init(&do_test_down_then_up_no_rebootstrap_loop_delay_cnt,
+                         0);
 
         /* Action 2 sets the only broker down, so the "all brokers down" state
-         * is reached and a re-bootstrap sequence starts immediately,
-         * decommissioning the learned broker. With every broker down no
-         * Metadata response can succeed, so the learned broker list cannot be
-         * rebuilt and stays empty until the broker is set up again. */
+         * is reached and a re-bootstrap sequence is scheduled after the
+         * re-bootstrap backoff, decommissioning the learned broker. With
+         * every broker down no Metadata response can succeed, so the learned
+         * broker list cannot be rebuilt and stays empty until the broker is
+         * set up again. */
         int32_t expected_brokers_cnt[] = {1, 1, 0, 1};
 
         int32_t expected_broker_ids[][5] = {{1}, {1}, {0}, {1}};
@@ -629,48 +667,105 @@ static void do_test_down_then_up_no_rebootstrap_loop(int outage_s) {
          * state again, that is a failed connection attempt to every broker
          * since the previous sequence. The learned broker is decommissioned
          * by the first sequence, so only the bootstrap broker remains and
-         * each of its failed attempts starts a new sequence.
+         * each of its failed attempts schedules a new sequence.
          *
-         * The attempt rate is not paced by `reconnect.backoff.ms`: a connect
-         * scheduled through `rd_kafka_connect_any()` zeroes
-         * `rkb_ts_reconnect` to expedite the reconnect, so the backoff never
-         * ramps. It depends instead on how many subsystems ask for a cluster
-         * connection while every broker is down: the sparse connection
-         * keepalive, its deferred retry and, with `enable.idempotence`, the
-         * ProducerID acquisition. That is a scheduling property, not a
-         * configured one, so it is not a stable number to assert on.
-         *
-         * What is bounded is the interval gating `rd_kafka_connect_any()`,
-         * `sparse_connect_intvl` = max(11, min(reconnect.backoff.ms / 2,
-         * 1000)), 50ms by default, so at most outage_ms / 50 sequences fit
-         * in the outage window (100 for 5s). A loop not gated by connection
-         * attempts would exceed that. */
-        max_rebootstrap_sequence_cnt    = outage_s * 1000 / 50;
+         * How fast those attempts fail is a platform property (refused at
+         * once, or timing out), so the number of sequences isn't a stable
+         * number to assert on. What is bounded is the delay between the
+         * "all brokers down" state and the sequence it schedules:
+         * `reconnect.backoff.ms` with -25%..+50% jitter, doubled on each
+         * consecutive sequence and capped at `reconnect.backoff.max.ms`.
+         * The k-th sequence can't start before the sum of the k shortest
+         * possible delays (75, 150, 300, ... ms), so count how many of those
+         * fit in the outage. A loop not paced by the backoff would exceed
+         * that. */
+        max_rebootstrap_sequence_cnt = 0;
+        backoff_ms                   = DO_TEST_DOWN_THEN_UP_BACKOFF_MS;
+        elapsed_ms                   = 0;
+        while (1) {
+                elapsed_ms += RD_MIN(backoff_ms * 3 / 4,
+                                     DO_TEST_DOWN_THEN_UP_BACKOFF_MAX_MS);
+                if (elapsed_ms > outage_s * 1000)
+                        break;
+                max_rebootstrap_sequence_cnt++;
+                backoff_ms = RD_MIN(backoff_ms * 2,
+                                    DO_TEST_DOWN_THEN_UP_BACKOFF_MAX_MS);
+        }
+        /* One more for a sequence scheduled during the outage that fires
+         * after the broker is set up again: the connection coming up cancels
+         * it, but the reconnect may take longer than the remaining delay. */
+        max_rebootstrap_sequence_cnt++;
+
         actual_rebootstrap_sequence_cnt = rd_atomic32_get(
             &do_test_down_then_up_no_rebootstrap_loop_rebootstrap_sequence_cnt);
         TEST_SAY("Found %d re-bootstrap sequences\n",
                  actual_rebootstrap_sequence_cnt);
-        TEST_ASSERT(
-            actual_rebootstrap_sequence_cnt <= max_rebootstrap_sequence_cnt,
-            "Expected at most %d re-bootstrap sequences, got %d",
-            max_rebootstrap_sequence_cnt, actual_rebootstrap_sequence_cnt);
+        TEST_ASSERT(actual_rebootstrap_sequence_cnt >= 1 &&
+                        actual_rebootstrap_sequence_cnt <=
+                            max_rebootstrap_sequence_cnt,
+                    "Expected 1..%d re-bootstrap sequences in a %ds outage, "
+                    "got %d",
+                    max_rebootstrap_sequence_cnt, outage_s,
+                    actual_rebootstrap_sequence_cnt);
 
-        /* Each of those sequences reaches the "all brokers down" state, but
-         * the `ALL_BROKERS_DOWN` error is reported to the application at most
-         * once every `reconnect.backoff.max.ms` (10s by default): one at the
-         * start of the outage and one more every 10s it lasts, so
-         * outage_s / 10 + 1 in total, not one per sequence. */
-        expected_all_brokers_down_cnt = outage_s / 10 + 1;
-        actual_all_brokers_down_cnt   = rd_atomic32_get(
+        /* Each all-brokers-down re-bootstrap must have been scheduled with
+         * the expected backoff: within the jitter range of
+         * `reconnect.backoff.ms`, doubled on each consecutive one and capped
+         * at `reconnect.backoff.max.ms`. The backoff is reset when a learned
+         * broker connection comes up, so a connection attempt that fails
+         * after the broker is set up again starts over from the initial
+         * backoff. */
+        delay_cnt = rd_atomic32_get(
+            &do_test_down_then_up_no_rebootstrap_loop_delay_cnt);
+        delay_cnt = RD_MIN(delay_cnt, DO_TEST_DOWN_THEN_UP_MAX_DELAYS);
+        TEST_ASSERT(delay_cnt >= 1,
+                    "Expected at least one all-brokers-down re-bootstrap "
+                    "to be scheduled with a backoff");
+        backoff_ms = DO_TEST_DOWN_THEN_UP_BACKOFF_MS;
+        for (i = 0; i < delay_cnt; i++) {
+                int delay_ms =
+                    do_test_down_then_up_no_rebootstrap_loop_delays_ms[i];
+                int min_ms, max_ms;
+
+                if (delay_ms < backoff_ms * 3 / 4 &&
+                    delay_ms <= DO_TEST_DOWN_THEN_UP_BACKOFF_MS * 3 / 2)
+                        /* Reset after the broker came up again. */
+                        backoff_ms = DO_TEST_DOWN_THEN_UP_BACKOFF_MS;
+
+                min_ms = backoff_ms * 3 / 4;
+                max_ms = RD_MIN(backoff_ms * 3 / 2,
+                                DO_TEST_DOWN_THEN_UP_BACKOFF_MAX_MS);
+                TEST_SAY("Re-bootstrap %d scheduled in %dms, "
+                         "expected %d..%dms\n",
+                         i + 1, delay_ms, min_ms, max_ms);
+                TEST_ASSERT(delay_ms >= min_ms && delay_ms <= max_ms,
+                            "Re-bootstrap %d scheduled in %dms, "
+                            "expected %d..%dms",
+                            i + 1, delay_ms, min_ms, max_ms);
+
+                backoff_ms = RD_MIN(backoff_ms * 2,
+                                    DO_TEST_DOWN_THEN_UP_BACKOFF_MAX_MS);
+        }
+
+        /* Each sequence reaches the "all brokers down" state, but the
+         * `ALL_BROKERS_DOWN` error is reported to the application at most
+         * once every `reconnect.backoff.max.ms` (10s here): one at the start
+         * of the outage and at most one more every 10s it lasts. Whether a
+         * sequence lands in each later window depends on the jitter, so
+         * only the bounds are exact. */
+        max_all_brokers_down_cnt =
+            outage_s * 1000 / DO_TEST_DOWN_THEN_UP_BACKOFF_MAX_MS + 1;
+        actual_all_brokers_down_cnt = rd_atomic32_get(
             &do_test_down_then_up_no_rebootstrap_loop_all_brokers_down_cnt);
         TEST_SAY("Found %d ALL_BROKERS_DOWN error(s)\n",
                  actual_all_brokers_down_cnt);
-        TEST_ASSERT(
-            actual_all_brokers_down_cnt == expected_all_brokers_down_cnt,
-            "Expected exactly %d ALL_BROKERS_DOWN error(s) over %d "
-            "re-bootstrap sequences in a %ds outage, got %d",
-            expected_all_brokers_down_cnt, actual_rebootstrap_sequence_cnt,
-            outage_s, actual_all_brokers_down_cnt);
+        TEST_ASSERT(actual_all_brokers_down_cnt >= 1 &&
+                        actual_all_brokers_down_cnt <=
+                            max_all_brokers_down_cnt,
+                    "Expected 1..%d ALL_BROKERS_DOWN error(s) over %d "
+                    "re-bootstrap sequences in a %ds outage, got %d",
+                    max_all_brokers_down_cnt, actual_rebootstrap_sequence_cnt,
+                    outage_s, actual_all_brokers_down_cnt);
 
         rd_free(log_interceptor);
         log_interceptor = NULL;

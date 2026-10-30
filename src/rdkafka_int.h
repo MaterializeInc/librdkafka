@@ -313,6 +313,10 @@ struct rd_kafka_s {
         /** Monotonic timestamp (microseconds) of the last time all brokers were
          * reported as down. */
         rd_atomic64_t rk_last_all_brokers_down_reported_ts;
+        /** Backoff (ms) for the next all-brokers-down re-bootstrap: doubles
+         *  up to reconnect.backoff.max.ms, 0 once a learned broker comes up.
+         *  64-bit only for rd_atomic64_cas(). */
+        rd_atomic64_t rk_rebootstrap_backoff_ms;
 
         /**< Additional bootstrap servers list.
          *   contains all brokers added through rd_kafka_brokers_add().
@@ -704,6 +708,9 @@ struct rd_kafka_s {
          *  Will add bootstrap brokers again
          *  when it's fired. */
         rd_kafka_timer_t rebootstrap_tmr;
+        /** Backed-off re-bootstrap because all brokers are down. Separate
+         *  from \c rebootstrap_tmr so a broker coming up can cancel it. */
+        rd_kafka_timer_t rebootstrap_backoff_tmr;
 
         thrd_t rk_thread;
 
@@ -1437,6 +1444,8 @@ rd_kafka_resp_err_t rd_kafka_background_thread_create(rd_kafka_t *rk,
                                                       size_t errstr_size);
 
 void rd_kafka_rebootstrap(rd_kafka_t *rk);
+void rd_kafka_rebootstrap_all_brokers_down(rd_kafka_t *rk);
+void rd_kafka_rebootstrap_backoff_tmr_stop(rd_kafka_t *rk, const char *reason);
 
 void rd_kafka_rebootstrap_tmr_start_maybe(rd_kafka_t *rk);
 
