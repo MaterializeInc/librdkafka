@@ -394,6 +394,7 @@ rd_bool_t rd_kafka_broker_ApiVersion_at_least_no_lock(rd_kafka_broker_t *rkb,
 void rd_kafka_broker_set_state(rd_kafka_broker_t *rkb, int state) {
         rd_bool_t trigger_monitors               = rd_false,
                   reset_any_broker_down_reported = rd_false,
+                  all_brokers_down               = rd_false,
                   skip_broker_down               = rkb->rkb_c.skip_broker_down;
 
         if ((int)rkb->rkb_state == state)
@@ -423,7 +424,7 @@ void rd_kafka_broker_set_state(rd_kafka_broker_t *rkb, int state) {
                             rd_atomic32_get(
                                 &rkb->rkb_rk->rk_logical_broker_cnt) &&
                     !rd_kafka_terminating(rkb->rkb_rk)) {
-                        rd_kafka_rebootstrap(rkb->rkb_rk);
+                        all_brokers_down = rd_true;
 
                         rd_ts_t now = rd_clock();
                         rd_ts_t rk_last_all_brokers_down_reported_ts =
@@ -475,6 +476,22 @@ void rd_kafka_broker_set_state(rd_kafka_broker_t *rkb, int state) {
                                     &rkb->rkb_rk
                                          ->rk_last_all_brokers_down_reported_ts,
                                     0);
+                                /* All brokers down is over: cancel the
+                                 * re-bootstrap it scheduled, which would
+                                 * otherwise tear this connection down. */
+                                rd_kafka_rebootstrap_backoff_tmr_stop(
+                                    rkb->rkb_rk, "broker connection is up");
+                                /* Only a learned broker proves the cluster
+                                 * is reachable: a bootstrap broker comes up
+                                 * on every re-bootstrap sequence even when
+                                 * the advertised brokers can't be reached,
+                                 * and resetting the backoff on it would keep
+                                 * that loop at the base delay. */
+                                if (rkb->rkb_source == RD_KAFKA_LEARNED)
+                                        rd_atomic64_set(
+                                            &rkb->rkb_rk
+                                                 ->rk_rebootstrap_backoff_ms,
+                                            0);
 
                                 /* If at least one broker connects we reset
                                  * the down counter to try again with rest of
@@ -508,6 +525,12 @@ void rd_kafka_broker_set_state(rd_kafka_broker_t *rkb, int state) {
                     rd_atomic32_get(&rkb->rkb_persistconn.coord) > 0)
                         trigger_monitors = rd_true;
         }
+
+        /* Scheduled after the rk_broker_up_cnt update above: it re-checks
+         * that count to catch a broker that came up meanwhile, and this
+         * broker's own Up -> Down transition must not count. */
+        if (all_brokers_down)
+                rd_kafka_rebootstrap_all_brokers_down(rkb->rkb_rk);
 
         rkb->rkb_state    = state;
         rkb->rkb_ts_state = rd_clock();

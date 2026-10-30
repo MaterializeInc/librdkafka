@@ -69,13 +69,14 @@ typedef struct rd_kafka_timer_s {
 int rd_kafka_timer_stop(rd_kafka_timers_t *rkts,
                         rd_kafka_timer_t *rtmr,
                         int lock);
-void rd_kafka_timer_start0(rd_kafka_timers_t *rkts,
-                           rd_kafka_timer_t *rtmr,
-                           rd_ts_t interval,
-                           rd_bool_t oneshot,
-                           rd_bool_t restart,
-                           void (*callback)(rd_kafka_timers_t *rkts, void *arg),
-                           void *arg);
+rd_bool_t
+rd_kafka_timer_start0(rd_kafka_timers_t *rkts,
+                      rd_kafka_timer_t *rtmr,
+                      rd_ts_t interval,
+                      rd_bool_t oneshot,
+                      rd_bool_t restart,
+                      void (*callback)(rd_kafka_timers_t *rkts, void *arg),
+                      void *arg);
 #define rd_kafka_timer_start(rkts, rtmr, interval, callback, arg)              \
         rd_kafka_timer_start0(rkts, rtmr, interval, rd_false, rd_true,         \
                               callback, arg)
