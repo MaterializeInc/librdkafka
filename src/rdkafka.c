@@ -4587,6 +4587,8 @@ void rd_kafka_rebootstrap_tmr_start_maybe(rd_kafka_t *rk) {
 
 /**
  * Stops rebootstrap timer, for example after a successful metadata response.
+ * Releases rk_rebootstrap_in_progress if the stopped timer was a pending
+ * immediate rebootstrap, so a later one can be scheduled.
  *
  * @return 1 if the timer was started (before being stopped), else 0.
  *
@@ -4595,12 +4597,25 @@ void rd_kafka_rebootstrap_tmr_start_maybe(rd_kafka_t *rk) {
  * @locality any
  */
 int rd_kafka_rebootstrap_tmr_stop(rd_kafka_t *rk) {
+        int stopped;
+
         if (rk->rk_conf.metadata_recovery_strategy ==
             RD_KAFKA_METADATA_RECOVERY_STRATEGY_NONE)
                 return 0;
 
-        return rd_kafka_timer_stop(&rk->rk_timers, &rk->rebootstrap_tmr,
-                                   rd_true /* lock */);
+        stopped = rd_kafka_timer_stop(&rk->rk_timers, &rk->rebootstrap_tmr,
+                                      rd_true /* lock */);
+        if (stopped)
+                /* The immediate rebootstrap set the flag; only its callback
+                 * clears it. Stopping the timer here would leave it set.
+                 * The stopped timer may instead be the trigger-interval one
+                 * while rd_kafka_rebootstrap() arms the immediate one on
+                 * another thread: the flag is then cleared with that timer
+                 * armed, and a second REBOOTSTRAP_REQUIRED in that window
+                 * schedules a duplicate sequence. Harmless. */
+                rd_atomic32_set(&rk->rk_rebootstrap_in_progress, 0);
+
+        return stopped;
 }
 
 /**
