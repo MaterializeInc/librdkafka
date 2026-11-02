@@ -712,6 +712,82 @@ static void do_test_add_same_broker_id(void) {
         SUB_TEST_PASS();
 }
 
+static rd_atomic32_t do_test_all_brokers_down_backoff_rebootstrap_cnt;
+
+static void do_test_all_brokers_down_backoff_log_cb(const rd_kafka_t *rk,
+                                                    int level,
+                                                    const char *fac,
+                                                    const char *buf) {
+        if (strstr(buf, "Starting re-bootstrap sequence"))
+                rd_atomic32_add(
+                    &do_test_all_brokers_down_backoff_rebootstrap_cnt, 1);
+}
+
+/**
+ * @brief While the only broker closes every connection during the ApiVersion
+ *        handshake, each failure starts a re-bootstrap sequence. The bootstrap
+ *        broker must keep its reconnect backoff across those sequences.
+ *
+ *        A consumer group is used because its coordinator query asks for a
+ *        cluster connection every `sparse_connect_intvl` (50 ms), so a reset
+ *        backoff shows up as about 90 sequences in 5 s. With the backoff kept,
+ *        3 to 4 were observed.
+ */
+static void do_test_all_brokers_down_backoff(void) {
+        rd_kafka_mock_cluster_t *cluster;
+        const char *bootstraps;
+        const char *debug_contexts[2] = {"generic", NULL};
+        rd_kafka_resp_err_t errs[500];
+        rd_kafka_conf_t *conf;
+        rd_kafka_t *rk;
+        rd_kafka_topic_partition_list_t *topics;
+        size_t i;
+        int32_t cnt;
+
+        SUB_TEST_QUICK();
+
+        rd_atomic32_init(&do_test_all_brokers_down_backoff_rebootstrap_cnt, 0);
+        cluster = test_mock_cluster_new(1, &bootstraps);
+        /* The mock broker closes the connection on a local transport error. */
+        for (i = 0; i < RD_ARRAY_SIZE(errs); i++)
+                errs[i] = RD_KAFKA_RESP_ERR__TRANSPORT;
+        rd_kafka_mock_push_request_errors_array(
+            cluster, RD_KAFKAP_ApiVersion, RD_ARRAY_SIZE(errs), errs);
+
+        test_conf_init(&conf, NULL, 30);
+        test_conf_set(conf, "bootstrap.servers", bootstraps);
+        test_conf_set(conf, "group.id", "all_brokers_down_backoff");
+        /* Avoid it being changed through test.conf */
+        test_conf_set(conf, "reconnect.backoff.ms", "100");
+        test_conf_set(conf, "reconnect.backoff.max.ms", "10000");
+        log_interceptor = test_conf_set_log_interceptor(
+            conf, do_test_all_brokers_down_backoff_log_cb, debug_contexts);
+        rk = test_create_handle(RD_KAFKA_CONSUMER, conf);
+
+        topics = rd_kafka_topic_partition_list_new(1);
+        rd_kafka_topic_partition_list_add(topics, "topic",
+                                          RD_KAFKA_PARTITION_UA);
+        TEST_CALL_ERR__(rd_kafka_subscribe(rk, topics));
+        rd_kafka_topic_partition_list_destroy(topics);
+
+        rd_sleep(5);
+        cnt =
+            rd_atomic32_get(&do_test_all_brokers_down_backoff_rebootstrap_cnt);
+
+        rd_kafka_destroy(rk);
+        test_mock_cluster_destroy(cluster);
+        rd_free(log_interceptor);
+        log_interceptor = NULL;
+
+        TEST_SAY("Found %" PRId32 " re-bootstrap sequences in 5s\n", cnt);
+        TEST_ASSERT(cnt >= 1 && cnt <= 10,
+                    "Expected 1 to 10 re-bootstrap sequences in 5s, "
+                    "got %" PRId32,
+                    cnt);
+
+        SUB_TEST_PASS();
+}
+
 typedef enum do_test_kip899_rebootstrap_cases_variation_t {
         /* re-bootstrap is enabled and triggered. */
         DO_TEST_KIP899_REBOOTSTRAP_CASES_VARIATION_REBOOTSTRAP_ENABLED = 0,
@@ -1563,6 +1639,8 @@ int main_0151_purge_brokers_mock(int argc, char **argv) {
         do_test_down_then_up_no_rebootstrap_loop(5);
 
         do_test_down_then_up_no_rebootstrap_loop(15);
+
+        do_test_all_brokers_down_backoff();
 
         do_test_kip899_rebootstrap_cases_variations();
 

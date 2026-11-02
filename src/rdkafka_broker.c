@@ -6743,13 +6743,15 @@ void rd_kafka_brokers_decommission_list(rd_kafka_t *rk, rd_list_t *brokers) {
 }
 
 /**
- * @brief Decommission all learned and configured (bootstrap) brokers,
- *        keeping the logical and internal ones.
+ * @brief Decommission all learned brokers and the configured (bootstrap)
+ *        brokers that have a connection, keeping the logical and internal
+ *        ones and the unconnected bootstrap brokers.
  *
- *        Used by the re-bootstrap sequence: the bootstrap brokers are
- *        re-added afterwards as new broker objects, so they're connected
- *        again and their addresses re-resolved, and only they are used
- *        until a Metadata response rebuilds the broker list. Partitions
+ *        Used by the re-bootstrap sequence: the decommissioned bootstrap
+ *        brokers are re-added afterwards as new broker objects, so they're
+ *        connected again and their addresses re-resolved, and only the
+ *        bootstrap brokers are used until a Metadata response rebuilds the
+ *        broker list. Partitions
  *        delegated to the decommissioned brokers are handed back with their
  *        queued messages, see `RD_KAFKA_OP_PARTITION_LEAVE` handling, and
  *        delegated again on the next Metadata response.
@@ -6770,8 +6772,29 @@ void rd_kafka_brokers_decommission_non_logical(rd_kafka_t *rk,
                      rd_atomic32_get(&rk->rk_broker_cnt), NULL);
 
         TAILQ_FOREACH(rkb, &rk->rk_brokers, rkb_link) {
+                int state;
+
                 if (rkb->rkb_source != RD_KAFKA_LEARNED &&
                     rkb->rkb_source != RD_KAFKA_CONFIGURED)
+                        continue;
+
+                rd_kafka_broker_lock(rkb);
+                state = rkb->rkb_state;
+                rd_kafka_broker_unlock(rkb);
+
+                /* A bootstrap broker without a connection has no stale
+                 * connection to drop, and its next connection resolves its
+                 * address again once `broker.address.ttl` has passed.
+                 * Replacing it would reset its reconnect backoff: when all
+                 * brokers are down, every failed attempt starts a new
+                 * re-bootstrap sequence, so the replacement would connect
+                 * again after `sparse_connect_intvl` instead of backing off
+                 * up to `reconnect.backoff.max.ms`. It is kept, and found
+                 * again when the bootstrap servers are re-added. */
+                if (rkb->rkb_source == RD_KAFKA_CONFIGURED &&
+                    (state == RD_KAFKA_BROKER_STATE_INIT ||
+                     state == RD_KAFKA_BROKER_STATE_DOWN ||
+                     state == RD_KAFKA_BROKER_STATE_TRY_CONNECT))
                         continue;
 
                 /* Don't try to decommission already decommissioning brokers
