@@ -712,15 +712,137 @@ static void do_test_add_same_broker_id(void) {
         SUB_TEST_PASS();
 }
 
+/**
+ * @brief Number of re-bootstrap sequences started.
+ */
 static rd_atomic32_t do_test_all_brokers_down_backoff_rebootstrap_cnt;
+
+/**
+ * @brief Set once broker 1 is learned from a successful Metadata response.
+ */
+static rd_atomic32_t do_test_all_brokers_down_backoff_recovered;
+
+/**
+ * @brief Log line prefix of the broker objects created for the first two
+ *        bootstrap servers, "<host>:<port>/bootstrap: Added new broker",
+ *        empty when not tracked.
+ */
+static char do_test_all_brokers_down_backoff_bootstrap_added[2][256];
+
+/**
+ * @brief Number of broker objects created for each tracked bootstrap server.
+ */
+static rd_atomic32_t do_test_all_brokers_down_backoff_bootstrap_added_cnt[2];
 
 static void do_test_all_brokers_down_backoff_log_cb(const rd_kafka_t *rk,
                                                     int level,
                                                     const char *fac,
                                                     const char *buf) {
-        if (strstr(buf, "Starting re-bootstrap sequence"))
+        int i;
+
+        if (strstr(buf, "Starting re-bootstrap sequence")) {
                 rd_atomic32_add(
                     &do_test_all_brokers_down_backoff_rebootstrap_cnt, 1);
+                return;
+        }
+
+        if (strstr(buf, "/1: Added new broker with NodeId 1")) {
+                rd_atomic32_set(&do_test_all_brokers_down_backoff_recovered, 1);
+                return;
+        }
+
+        for (i = 0; i < 2; i++) {
+                if (*do_test_all_brokers_down_backoff_bootstrap_added[i] &&
+                    strstr(buf,
+                           do_test_all_brokers_down_backoff_bootstrap_added[i]))
+                        rd_atomic32_add(
+                            &do_test_all_brokers_down_backoff_bootstrap_added_cnt
+                                [i],
+                            1);
+        }
+}
+
+/**
+ * @brief Reset the counters and stop tracking bootstrap broker objects.
+ */
+static void do_test_all_brokers_down_backoff_reset(void) {
+        int i;
+
+        rd_atomic32_init(&do_test_all_brokers_down_backoff_rebootstrap_cnt, 0);
+        rd_atomic32_init(&do_test_all_brokers_down_backoff_recovered, 0);
+        for (i = 0; i < 2; i++) {
+                *do_test_all_brokers_down_backoff_bootstrap_added[i] = '\0';
+                rd_atomic32_init(
+                    &do_test_all_brokers_down_backoff_bootstrap_added_cnt[i],
+                    0);
+        }
+}
+
+/**
+ * @brief Make every connection to \p cluster fail during the ApiVersion
+ *        handshake: the mock broker closes the connection on a local
+ *        transport error.
+ */
+static void do_test_all_brokers_down_backoff_fail_handshakes(
+    rd_kafka_mock_cluster_t *cluster) {
+        rd_kafka_resp_err_t errs[500];
+        size_t i;
+
+        for (i = 0; i < RD_ARRAY_SIZE(errs); i++)
+                errs[i] = RD_KAFKA_RESP_ERR__TRANSPORT;
+        rd_kafka_mock_push_request_errors_array(cluster, RD_KAFKAP_ApiVersion,
+                                                RD_ARRAY_SIZE(errs), errs);
+}
+
+/**
+ * @brief Create a client of \p type that keeps asking for a cluster
+ *        connection: a consumer joins a group, so its coordinator query asks
+ *        for one every `sparse_connect_intvl` (50 ms), and a producer has a
+ *        message queued for a topic whose metadata it doesn't have yet.
+ */
+static rd_kafka_t *do_test_all_brokers_down_backoff_client_new(
+    rd_kafka_type_t type,
+    const char *bootstraps,
+    const char *reconnect_backoff_max_ms) {
+        const char *debug_contexts[3] = {"generic", "broker", NULL};
+        rd_kafka_conf_t *conf;
+        rd_kafka_t *rk;
+
+        test_conf_init(&conf, NULL, 30);
+        test_conf_set(conf, "bootstrap.servers", bootstraps);
+        /* Avoid it being changed through test.conf */
+        test_conf_set(conf, "reconnect.backoff.ms", "100");
+        test_conf_set(conf, "reconnect.backoff.max.ms",
+                      reconnect_backoff_max_ms);
+        if (type == RD_KAFKA_CONSUMER)
+                test_conf_set(conf, "group.id", "all_brokers_down_backoff");
+        log_interceptor = test_conf_set_log_interceptor(
+            conf, do_test_all_brokers_down_backoff_log_cb, debug_contexts);
+        rk = test_create_handle(type, conf);
+
+        if (type == RD_KAFKA_CONSUMER) {
+                rd_kafka_topic_partition_list_t *topics =
+                    rd_kafka_topic_partition_list_new(1);
+                rd_kafka_topic_partition_list_add(topics, "topic",
+                                                  RD_KAFKA_PARTITION_UA);
+                TEST_CALL_ERR__(rd_kafka_subscribe(rk, topics));
+                rd_kafka_topic_partition_list_destroy(topics);
+        } else {
+                TEST_CALL_ERR__(rd_kafka_producev(rk, RD_KAFKA_V_TOPIC("topic"),
+                                                  RD_KAFKA_V_VALUE("v", 1),
+                                                  RD_KAFKA_V_END));
+        }
+
+        return rk;
+}
+
+static void do_test_all_brokers_down_backoff_client_destroy(rd_kafka_t *rk) {
+        if (rd_kafka_type(rk) == RD_KAFKA_PRODUCER)
+                TEST_CALL_ERR__(rd_kafka_purge(
+                    rk, RD_KAFKA_PURGE_F_QUEUE | RD_KAFKA_PURGE_F_INFLIGHT));
+        rd_kafka_destroy(rk);
+        rd_free(log_interceptor);
+        log_interceptor = NULL;
 }
 
 /**
@@ -728,62 +850,186 @@ static void do_test_all_brokers_down_backoff_log_cb(const rd_kafka_t *rk,
  *        handshake, each failure starts a re-bootstrap sequence. The bootstrap
  *        broker must keep its reconnect backoff across those sequences.
  *
- *        A consumer group is used because its coordinator query asks for a
- *        cluster connection every `sparse_connect_intvl` (50 ms), so a reset
+ *        Both client types ask for a cluster connection every
+ *        `sparse_connect_intvl` (50 ms) while no broker is up, so a reset
  *        backoff shows up as about 90 sequences in 5 s. With the backoff kept,
  *        3 to 4 were observed.
+ *
+ * @param type Client type, the consumer and the producer create connection
+ *             demand through different paths.
  */
-static void do_test_all_brokers_down_backoff(void) {
+static void do_test_all_brokers_down_backoff(rd_kafka_type_t type) {
         rd_kafka_mock_cluster_t *cluster;
         const char *bootstraps;
-        const char *debug_contexts[2] = {"generic", NULL};
-        rd_kafka_resp_err_t errs[500];
-        rd_kafka_conf_t *conf;
         rd_kafka_t *rk;
-        rd_kafka_topic_partition_list_t *topics;
-        size_t i;
         int32_t cnt;
 
-        SUB_TEST_QUICK();
+        SUB_TEST_QUICK("%s",
+                       type == RD_KAFKA_PRODUCER ? "producer" : "consumer");
 
-        rd_atomic32_init(&do_test_all_brokers_down_backoff_rebootstrap_cnt, 0);
+        do_test_all_brokers_down_backoff_reset();
         cluster = test_mock_cluster_new(1, &bootstraps);
-        /* The mock broker closes the connection on a local transport error. */
-        for (i = 0; i < RD_ARRAY_SIZE(errs); i++)
-                errs[i] = RD_KAFKA_RESP_ERR__TRANSPORT;
-        rd_kafka_mock_push_request_errors_array(
-            cluster, RD_KAFKAP_ApiVersion, RD_ARRAY_SIZE(errs), errs);
+        do_test_all_brokers_down_backoff_fail_handshakes(cluster);
 
-        test_conf_init(&conf, NULL, 30);
-        test_conf_set(conf, "bootstrap.servers", bootstraps);
-        test_conf_set(conf, "group.id", "all_brokers_down_backoff");
-        /* Avoid it being changed through test.conf */
-        test_conf_set(conf, "reconnect.backoff.ms", "100");
-        test_conf_set(conf, "reconnect.backoff.max.ms", "10000");
-        log_interceptor = test_conf_set_log_interceptor(
-            conf, do_test_all_brokers_down_backoff_log_cb, debug_contexts);
-        rk = test_create_handle(RD_KAFKA_CONSUMER, conf);
-
-        topics = rd_kafka_topic_partition_list_new(1);
-        rd_kafka_topic_partition_list_add(topics, "topic",
-                                          RD_KAFKA_PARTITION_UA);
-        TEST_CALL_ERR__(rd_kafka_subscribe(rk, topics));
-        rd_kafka_topic_partition_list_destroy(topics);
+        rk = do_test_all_brokers_down_backoff_client_new(type, bootstraps,
+                                                         "10000");
 
         rd_sleep(5);
         cnt =
             rd_atomic32_get(&do_test_all_brokers_down_backoff_rebootstrap_cnt);
 
-        rd_kafka_destroy(rk);
+        do_test_all_brokers_down_backoff_client_destroy(rk);
         test_mock_cluster_destroy(cluster);
-        rd_free(log_interceptor);
-        log_interceptor = NULL;
 
         TEST_SAY("Found %" PRId32 " re-bootstrap sequences in 5s\n", cnt);
         TEST_ASSERT(cnt >= 1 && cnt <= 10,
                     "Expected 1 to 10 re-bootstrap sequences in 5s, "
                     "got %" PRId32,
                     cnt);
+
+        SUB_TEST_PASS();
+}
+
+/**
+ * @brief After the outage of `do_test_all_brokers_down_backoff()` ends, the
+ *        kept bootstrap broker must reconnect on its own backoff, at most
+ *        `reconnect.backoff.max.ms` after the outage, and the client must
+ *        get the broker list from it again.
+ *
+ *        The backoff reaches its 1 s cap during the 3 s outage, so recovery
+ *        is expected within about 1 s. The 5 s bound leaves room for the
+ *        handshake and the Metadata request on a loaded machine.
+ */
+static void do_test_all_brokers_down_backoff_recovery(void) {
+        rd_kafka_mock_cluster_t *cluster;
+        const char *bootstraps;
+        rd_kafka_t *rk;
+        rd_ts_t outage_end, abs_timeout;
+        rd_bool_t recovered;
+        int64_t recovery_ms;
+
+        SUB_TEST_QUICK();
+
+        do_test_all_brokers_down_backoff_reset();
+        cluster = test_mock_cluster_new(1, &bootstraps);
+        do_test_all_brokers_down_backoff_fail_handshakes(cluster);
+
+        rk = do_test_all_brokers_down_backoff_client_new(RD_KAFKA_CONSUMER,
+                                                         bootstraps, "1000");
+
+        rd_sleep(3);
+        TEST_ASSERT(
+            !rd_atomic32_get(&do_test_all_brokers_down_backoff_recovered),
+            "Expected no Metadata response while every handshake fails");
+        TEST_ASSERT(
+            rd_atomic32_get(&do_test_all_brokers_down_backoff_rebootstrap_cnt) >
+                0,
+            "Expected at least one re-bootstrap sequence during the outage");
+
+        rd_kafka_mock_clear_request_errors(cluster, RD_KAFKAP_ApiVersion);
+        outage_end  = test_clock();
+        abs_timeout = outage_end + 5 * 1000 * 1000;
+        while (!(recovered = rd_atomic32_get(
+                     &do_test_all_brokers_down_backoff_recovered)) &&
+               test_clock() < abs_timeout)
+                rd_usleep(10 * 1000, 0);
+        recovery_ms = (test_clock() - outage_end) / 1000;
+
+        do_test_all_brokers_down_backoff_client_destroy(rk);
+        test_mock_cluster_destroy(cluster);
+
+        TEST_SAY("Recovered: %s after %" PRId64 " ms\n",
+                 recovered ? "yes" : "no", recovery_ms);
+        TEST_ASSERT(recovered,
+                    "Expected the broker list to be learned again within "
+                    "5000 ms of the outage ending");
+
+        SUB_TEST_PASS();
+}
+
+/**
+ * @brief A re-bootstrap sequence replaces only the bootstrap brokers that are
+ *        UP or REAUTH and keeps the others with their reconnect backoff.
+ *
+ *        Broker 2 is down, so its bootstrap broker never comes up. Broker 1
+ *        answers each Metadata request with `REBOOTSTRAP_REQUIRED` from an
+ *        UP connection, so every sequence must replace its bootstrap broker
+ *        with a new object and find the one of broker 2 again. Once the
+ *        errors run out the Metadata response succeeds and decommissions both
+ *        bootstrap brokers without re-adding them.
+ */
+static void do_test_rebootstrap_replaces_only_up_bootstrap_brokers(void) {
+        rd_kafka_mock_cluster_t *cluster;
+        const char *bootstraps;
+        rd_kafka_resp_err_t errs[5];
+        char *bootstraps_copy, *second;
+        rd_kafka_t *rk;
+        rd_ts_t abs_timeout;
+        int32_t rebootstrap_cnt, broker1_added_cnt, broker2_added_cnt;
+        size_t i;
+
+        SUB_TEST_QUICK();
+
+        do_test_all_brokers_down_backoff_reset();
+        cluster = test_mock_cluster_new(2, &bootstraps);
+
+        /* The mock cluster lists its brokers by id. */
+        bootstraps_copy = rd_strdup(bootstraps);
+        second          = strchr(bootstraps_copy, ',');
+        TEST_ASSERT(second, "Expected two bootstrap servers in %s", bootstraps);
+        *second++ = '\0';
+        rd_snprintf(do_test_all_brokers_down_backoff_bootstrap_added[0],
+                    sizeof(do_test_all_brokers_down_backoff_bootstrap_added[0]),
+                    "%s/bootstrap: Added new broker", bootstraps_copy);
+        rd_snprintf(do_test_all_brokers_down_backoff_bootstrap_added[1],
+                    sizeof(do_test_all_brokers_down_backoff_bootstrap_added[1]),
+                    "%s/bootstrap: Added new broker", second);
+        rd_free(bootstraps_copy);
+
+        TEST_CALL_ERR__(rd_kafka_mock_broker_set_down(cluster, 2));
+        for (i = 0; i < RD_ARRAY_SIZE(errs); i++)
+                errs[i] = RD_KAFKA_RESP_ERR_REBOOTSTRAP_REQUIRED;
+        rd_kafka_mock_push_request_errors_array(cluster, RD_KAFKAP_Metadata,
+                                                RD_ARRAY_SIZE(errs), errs);
+
+        rk = do_test_all_brokers_down_backoff_client_new(RD_KAFKA_CONSUMER,
+                                                         bootstraps, "10000");
+
+        /* Wait for the errors to run out and the broker list to be learned. */
+        abs_timeout = test_clock() + 10 * 1000 * 1000;
+        while (!rd_atomic32_get(&do_test_all_brokers_down_backoff_recovered) &&
+               test_clock() < abs_timeout)
+                rd_usleep(10 * 1000, 0);
+        TEST_ASSERT(
+            rd_atomic32_get(&do_test_all_brokers_down_backoff_recovered),
+            "Expected the broker list to be learned within 10s");
+
+        rebootstrap_cnt =
+            rd_atomic32_get(&do_test_all_brokers_down_backoff_rebootstrap_cnt);
+        broker1_added_cnt = rd_atomic32_get(
+            &do_test_all_brokers_down_backoff_bootstrap_added_cnt[0]);
+        broker2_added_cnt = rd_atomic32_get(
+            &do_test_all_brokers_down_backoff_bootstrap_added_cnt[1]);
+
+        do_test_all_brokers_down_backoff_client_destroy(rk);
+        test_mock_cluster_destroy(cluster);
+
+        TEST_SAY("%" PRId32
+                 " re-bootstrap sequences, bootstrap broker objects created: "
+                 "%" PRId32 " for broker 1 (up), %" PRId32
+                 " for broker 2 (down)\n",
+                 rebootstrap_cnt, broker1_added_cnt, broker2_added_cnt);
+        TEST_ASSERT(rebootstrap_cnt >= 2,
+                    "Expected at least 2 re-bootstrap sequences, got %" PRId32,
+                    rebootstrap_cnt);
+        TEST_ASSERT(broker1_added_cnt >= 2,
+                    "Expected the UP bootstrap broker to be replaced, it was "
+                    "created %" PRId32 " time(s)",
+                    broker1_added_cnt);
+        TEST_ASSERT(broker2_added_cnt == 1,
+                    "Expected the down bootstrap broker to be created once "
+                    "and kept, it was created %" PRId32 " time(s)",
+                    broker2_added_cnt);
 
         SUB_TEST_PASS();
 }
@@ -1640,7 +1886,10 @@ int main_0151_purge_brokers_mock(int argc, char **argv) {
 
         do_test_down_then_up_no_rebootstrap_loop(15);
 
-        do_test_all_brokers_down_backoff();
+        do_test_all_brokers_down_backoff(RD_KAFKA_CONSUMER);
+        do_test_all_brokers_down_backoff(RD_KAFKA_PRODUCER);
+        do_test_all_brokers_down_backoff_recovery();
+        do_test_rebootstrap_replaces_only_up_bootstrap_brokers();
 
         do_test_kip899_rebootstrap_cases_variations();
 

@@ -2263,11 +2263,11 @@ static void rd_kafka_rebootstrap_tmr_cb(rd_kafka_timers_t *rkts, void *arg) {
         rd_kafka_reset_any_broker_down_reported(rk);
 
         /* Decommission the learned brokers and the configured (bootstrap)
-         * brokers with an established connection, keeping the other
-         * bootstrap brokers with their reconnect backoff, see
-         * rd_kafka_brokers_decommission_non_logical(): from now on, until
-         * a successful Metadata response rebuilds the broker list, only the
-         * bootstrap brokers may be used.
+         * brokers that are usable (UP or REAUTH), keeping the bootstrap
+         * brokers that are down or still connecting with their reconnect
+         * backoff, see rd_kafka_brokers_decommission_non_logical(): from
+         * now on, until a successful Metadata response rebuilds the broker
+         * list, only the bootstrap brokers may be used.
          *
          * Re-adding the bootstrap brokers isn't enough on its own:
          *

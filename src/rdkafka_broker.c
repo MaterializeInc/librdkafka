@@ -6744,8 +6744,9 @@ void rd_kafka_brokers_decommission_list(rd_kafka_t *rk, rd_list_t *brokers) {
 
 /**
  * @brief Decommission all learned brokers and the configured (bootstrap)
- *        brokers with an established connection, keeping the logical and
- *        internal ones and the other bootstrap brokers.
+ *        brokers that are usable (UP or REAUTH), keeping the logical and
+ *        internal ones and the bootstrap brokers that are down or still
+ *        connecting.
  *
  *        Used by the re-bootstrap sequence: the decommissioned bootstrap
  *        brokers are re-added afterwards as new broker objects, so they're
