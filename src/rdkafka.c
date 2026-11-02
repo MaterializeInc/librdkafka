@@ -2262,10 +2262,11 @@ static void rd_kafka_rebootstrap_tmr_cb(rd_kafka_timers_t *rkts, void *arg) {
         rd_atomic32_set(&rk->rk_rebootstrap_in_progress, 1);
         rd_kafka_reset_any_broker_down_reported(rk);
 
-        /* Decommission the learned and the connected configured (bootstrap)
-         * brokers, see rd_kafka_brokers_decommission_non_logical(): from now
-         * on, until a successful Metadata response rebuilds the broker list,
-         * only the bootstrap brokers may be used.
+        /* Decommission the learned brokers and the configured (bootstrap)
+         * brokers with an established connection, see
+         * rd_kafka_brokers_decommission_non_logical(): from now on, until a
+         * successful Metadata response rebuilds the broker list, only the
+         * bootstrap brokers may be used.
          *
          * Re-adding the bootstrap brokers isn't enough on its own:
          *
