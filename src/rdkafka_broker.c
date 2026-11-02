@@ -6772,32 +6772,35 @@ void rd_kafka_brokers_decommission_non_logical(rd_kafka_t *rk,
                      rd_atomic32_get(&rk->rk_broker_cnt), NULL);
 
         TAILQ_FOREACH(rkb, &rk->rk_brokers, rkb_link) {
-                rd_kafka_broker_state_t state;
-
                 if (rkb->rkb_source != RD_KAFKA_LEARNED &&
                     rkb->rkb_source != RD_KAFKA_CONFIGURED)
                         continue;
-
-                state = rd_kafka_broker_get_state(rkb);
-
-                /* A bootstrap broker without an established connection has
-                 * no stale connection to drop: its connection attempts
-                 * re-resolve its address once `broker.address.ttl` has
-                 * passed, and one that reaches a stale cluster gets
-                 * `REBOOTSTRAP_REQUIRED` once UP and is replaced by the next
-                 * sequence. Replacing it would reset its reconnect backoff:
-                 * when all brokers are down, every failed attempt starts a
-                 * new re-bootstrap sequence, so the replacement would
-                 * connect again after `sparse_connect_intvl` instead of
-                 * backing off up to `reconnect.backoff.max.ms`. The
-                 * connecting states are kept too, as a broker whose backoff
-                 * elapsed before it failed is already connecting again when
-                 * this runs. It is found again when the bootstrap servers
-                 * are re-added. */
-                if (rkb->rkb_source == RD_KAFKA_CONFIGURED &&
-                    state != RD_KAFKA_BROKER_STATE_UP &&
-                    state != RD_KAFKA_BROKER_STATE_REAUTH)
+                /* Keep a bootstrap broker that isn't UP or REAUTH: replacing
+                 * it would reset its reconnect backoff. When all brokers are
+                 * down, every failed attempt starts a new re-bootstrap
+                 * sequence, so a new broker object would connect again after
+                 * `sparse_connect_intvl` instead of backing off up to
+                 * `reconnect.backoff.max.ms`.
+                 *
+                 * Its address is re-resolved once `broker.address.ttl` has
+                 * passed. An attempt in progress may already hold a socket
+                 * to the previously resolved address: if that is a stale
+                 * cluster, the broker gets `REBOOTSTRAP_REQUIRED` once UP
+                 * and the next sequence replaces it.
+                 *
+                 * The backoff only survives while the broker wants a
+                 * connection: a broker back in INIT is selected by
+                 * rd_kafka_connect_any(), whose CONNECT op skips the
+                 * backoff. It is found again when the bootstrap servers are
+                 * re-added. With `resolve_canonical_bootstrap_servers_only`,
+                 * a kept broker whose name DNS no longer returns stays until
+                 * the first successful Metadata response decommissions it. */
+                if (rkb->rkb_source == RD_KAFKA_CONFIGURED) {
+                    rd_kafka_broker_state_t state = rd_kafka_broker_get_state(rkb);
+                    if (state != RD_KAFKA_BROKER_STATE_UP &&
+                        state != RD_KAFKA_BROKER_STATE_REAUTH)
                         continue;
+                }
 
                 /* Don't try to decommission already decommissioning brokers
                  * otherwise they could be already destroyed when
