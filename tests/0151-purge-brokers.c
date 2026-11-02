@@ -769,6 +769,436 @@ static void do_test_down_then_up_no_rebootstrap_loop(int outage_s) {
         SUB_TEST_PASS();
 }
 
+/** Counters for do_test_recovery_skips_pending_rebootstrap(). */
+static rd_atomic32_t do_test_recovery_skips_sequence_cnt;
+/** Backoff (ms) set by the last re-bootstrap sequence, parsed from the
+ *  "next re-bootstrap not before <N>ms" debug line. */
+static rd_atomic32_t do_test_recovery_skips_last_delay_ms;
+/** Remaining backoff (ms) of the last re-bootstrap that was put off, parsed
+ *  from the "All brokers are down: re-bootstrap in <N>ms" debug line. */
+static rd_atomic32_t do_test_recovery_skips_last_pending_ms;
+/** Pending re-bootstraps skipped because a broker connection was up. */
+static rd_atomic32_t do_test_recovery_skips_skipped_cnt;
+/** Bootstrap broker handles terminated: the decommission of the bootstrap
+ *  broker once the learned one is known, and one per re-bootstrap sequence
+ *  that replaces it. */
+static rd_atomic32_t do_test_recovery_skips_bootstrap_gone_cnt;
+/** Learned broker connections that reached the UP state. */
+static rd_atomic32_t do_test_recovery_skips_learned_up_cnt;
+
+static void do_test_recovery_skips_log_cb(const rd_kafka_t *rk,
+                                          int level,
+                                          const char *fac,
+                                          const char *buf) {
+        static const char delay_prefix[] = "next re-bootstrap not before ";
+        static const char pending_prefix[] =
+            "All brokers are down: re-bootstrap in ";
+        const char *delay_str, *state_str;
+        int delay_ms;
+
+        if (strstr(buf, "Starting re-bootstrap sequence")) {
+                rd_atomic32_add(&do_test_recovery_skips_sequence_cnt, 1);
+        } else if ((state_str = strstr(buf, "Broker changed state")) &&
+                   (state_str = strstr(state_str, "-> UP")) &&
+                   state_str[5] == '\0' && !strstr(buf, "/bootstrap:") &&
+                   !strstr(buf, "/internal:")) {
+                rd_atomic32_add(&do_test_recovery_skips_learned_up_cnt, 1);
+        } else if (strstr(buf, "skipping re-bootstrap")) {
+                rd_atomic32_add(&do_test_recovery_skips_skipped_cnt, 1);
+        } else if (strstr(buf, "/bootstrap: Handle terminates")) {
+                rd_atomic32_add(&do_test_recovery_skips_bootstrap_gone_cnt,
+                                1);
+        } else if ((delay_str = strstr(buf, delay_prefix)) &&
+                   sscanf(delay_str + strlen(delay_prefix), "%dms",
+                          &delay_ms) == 1) {
+                rd_atomic32_set(&do_test_recovery_skips_last_delay_ms,
+                                delay_ms);
+        } else if ((delay_str = strstr(buf, pending_prefix)) &&
+                   sscanf(delay_str + strlen(pending_prefix), "%dms",
+                          &delay_ms) == 1) {
+                rd_atomic32_set(&do_test_recovery_skips_last_pending_ms,
+                                delay_ms);
+        }
+}
+
+static void do_test_rebootstrap_backoff_error_cb(rd_kafka_t *rk,
+                                                 int err,
+                                                 const char *reason,
+                                                 void *opaque) {
+        if (err != RD_KAFKA_RESP_ERR__ALL_BROKERS_DOWN &&
+            err != RD_KAFKA_RESP_ERR__TRANSPORT &&
+            err != RD_KAFKA_RESP_ERR__TIMED_OUT)
+                TEST_FAIL("Unexpected error: %s: %s", rd_kafka_err2name(err),
+                          reason);
+}
+
+/**
+ * @brief Polls \p rk until \p cnt reaches \p expected or \p timeout_ms
+ *        passes.
+ *
+ * @returns the final value of \p cnt.
+ */
+static int32_t do_test_rebootstrap_backoff_await(rd_kafka_t *rk,
+                                                 rd_atomic32_t *cnt,
+                                                 int32_t expected,
+                                                 int timeout_ms) {
+        int64_t abs_timeout_us = test_clock() + timeout_ms * 1000LL;
+        while (rd_atomic32_get(cnt) < expected && test_clock() < abs_timeout_us)
+                rd_kafka_poll(rk, 100);
+        return rd_atomic32_get(cnt);
+}
+
+/**
+ * @brief A pending all-brokers-down re-bootstrap must be skipped once a
+ *        broker connection is up, and the backoff must start over after an
+ *        idle period longer than `reconnect.backoff.max.ms`.
+ *
+ * The only broker goes down and stays down while the re-bootstrap backoff
+ * ramps up: each sequence re-adds the bootstrap broker as a new object, and
+ * its failure asks for the next sequence, which is put off until the backoff
+ * has passed. Once a re-bootstrap has been put off by at least 2.5x
+ * `reconnect.backoff.ms`, the broker is set up again: the newest bootstrap
+ * broker, waiting for a connection request, reconnects within about 1.5x
+ * `reconnect.backoff.ms` (the sparse connection timer and interval), before
+ * the pending re-bootstrap, which must then be skipped. Its first Metadata
+ * responses are delayed past the pending delay, so without the skip the
+ * sequence would run on the healthy connection and decommission it.
+ *
+ * Then, more than `reconnect.backoff.max.ms` after the last re-bootstrap was
+ * due, the broker goes down again: a re-bootstrap must run at once and set
+ * the initial backoff, not a doubled one.
+ */
+static void do_test_recovery_skips_pending_rebootstrap(void) {
+        rd_kafka_mock_cluster_t *cluster;
+        const char *bootstraps;
+        const char *debug_contexts[3] = {"generic", "broker", NULL};
+        rd_kafka_conf_t *conf;
+        rd_kafka_t *rk;
+        const rd_kafka_metadata_t *md;
+        rd_kafka_resp_err_t err;
+        const int backoff_ms     = 1000;
+        const int backoff_max_ms = 5000;
+        /* Remaining backoff to wait for before setting the broker up: more
+         * than the newest bootstrap broker takes to reconnect once the
+         * broker is up, about 1.5x. */
+        const int min_pending_ms = backoff_ms * 5 / 2;
+        /* Longer than the longest possible backoff, so that without the skip
+         * the sequence always runs before the response. */
+        const int metadata_rtt_ms = backoff_max_ms + 2 * backoff_ms;
+        int64_t abs_timeout_us, last_due_us;
+        int32_t cnt, delay_ms, bootstrap_gone_before, sequences_before,
+            learned_up_before;
+
+        SUB_TEST_QUICK();
+
+        rd_atomic32_init(&do_test_recovery_skips_sequence_cnt, 0);
+        rd_atomic32_init(&do_test_recovery_skips_last_delay_ms, 0);
+        rd_atomic32_init(&do_test_recovery_skips_last_pending_ms, 0);
+        rd_atomic32_init(&do_test_recovery_skips_skipped_cnt, 0);
+        rd_atomic32_init(&do_test_recovery_skips_bootstrap_gone_cnt, 0);
+        rd_atomic32_init(&do_test_recovery_skips_learned_up_cnt, 0);
+
+        cluster = test_mock_cluster_new(1, &bootstraps);
+
+        test_conf_init(&conf, NULL, 120);
+        test_conf_set(conf, "bootstrap.servers", bootstraps);
+        test_conf_set(conf, "reconnect.backoff.ms",
+                      tsprintf("%d", backoff_ms));
+        test_conf_set(conf, "reconnect.backoff.max.ms",
+                      tsprintf("%d", backoff_max_ms));
+        /* A connection to the broker set down isn't refused on every
+         * platform: the mock cluster keeps a listening socket it doesn't
+         * serve. Bound the time an attempt takes to fail. */
+        test_conf_set(conf, "socket.connection.setup.timeout.ms", "1000");
+        log_interceptor = test_conf_set_log_interceptor(
+            conf, do_test_recovery_skips_log_cb, debug_contexts);
+        rd_kafka_conf_set_error_cb(conf, do_test_rebootstrap_backoff_error_cb);
+        rk = test_create_handle(RD_KAFKA_PRODUCER, conf);
+
+        TEST_SAY("Awaiting initial connection and metadata\n");
+        err = rd_kafka_metadata(rk, 0, NULL, &md, 10000);
+        TEST_ASSERT(!err, "Initial metadata failed: %s", rd_kafka_err2str(err));
+        rd_kafka_metadata_destroy(md);
+        /* Let the bootstrap broker, decommissioned now that the learned one
+         * is known, wind down: while it does it still counts as a broker,
+         * so the learned one going down wouldn't be "all brokers down". Its
+         * thread logs "Handle terminates" right before removing it. */
+        cnt = do_test_rebootstrap_backoff_await(
+            rk, &do_test_recovery_skips_bootstrap_gone_cnt, 1, 10000);
+        TEST_ASSERT(cnt >= 1, "Expected the bootstrap broker to be "
+                              "decommissioned after the first metadata");
+        rd_usleep(100 * 1000, 0);
+
+        TEST_SAY("Setting the only broker down\n");
+        TEST_ASSERT(rd_kafka_mock_broker_set_down(cluster, 1) == 0,
+                    "Failed to set broker down");
+
+        TEST_SAY("Awaiting a re-bootstrap put off by at least %dms\n",
+                 min_pending_ms);
+        abs_timeout_us = test_clock() + 60 * 1000000LL;
+        while (rd_atomic32_get(&do_test_recovery_skips_last_pending_ms) <
+                   min_pending_ms &&
+               test_clock() < abs_timeout_us)
+                rd_kafka_poll(rk, 100);
+        delay_ms = rd_atomic32_get(&do_test_recovery_skips_last_pending_ms);
+        cnt      = rd_atomic32_get(&do_test_recovery_skips_sequence_cnt);
+        TEST_SAY("Re-bootstrap %d put off by %dms (backoff %dms)\n", cnt + 1,
+                 delay_ms,
+                 rd_atomic32_get(&do_test_recovery_skips_last_delay_ms));
+        TEST_ASSERT(delay_ms >= min_pending_ms,
+                    "Expected a re-bootstrap put off by at least %dms, "
+                    "got %dms after %d sequences",
+                    min_pending_ms, delay_ms, cnt);
+        /* The pending re-bootstrap is due this long after its debug line
+         * was logged, at most one poll interval ago. */
+        last_due_us = test_clock() + delay_ms * 1000LL;
+
+        TEST_SAY("Setting the broker up, with slow Metadata responses\n");
+        /* The client refreshes metadata as soon as the connection is up.
+         * Delay the next Metadata responses past the pending backoff: the
+         * connection is up and healthy, only the responses are slow. */
+        err = rd_kafka_mock_broker_push_request_error_rtts(
+            cluster, 1, RD_KAFKAP_Metadata, 2, RD_KAFKA_RESP_ERR_NO_ERROR,
+            metadata_rtt_ms, RD_KAFKA_RESP_ERR_NO_ERROR, metadata_rtt_ms);
+        TEST_ASSERT(!err, "Failed to push Metadata delays: %s",
+                    rd_kafka_err2str(err));
+        bootstrap_gone_before =
+            rd_atomic32_get(&do_test_recovery_skips_bootstrap_gone_cnt);
+        sequences_before =
+            rd_atomic32_get(&do_test_recovery_skips_sequence_cnt);
+        learned_up_before =
+            rd_atomic32_get(&do_test_recovery_skips_learned_up_cnt);
+        TEST_ASSERT(rd_kafka_mock_broker_set_up(cluster, 1) == 0,
+                    "Failed to set broker up");
+
+        TEST_SAY("Awaiting the pending re-bootstrap to be skipped\n");
+        cnt = do_test_rebootstrap_backoff_await(
+            rk, &do_test_recovery_skips_skipped_cnt, 1, 15000);
+        TEST_ASSERT(cnt >= 1,
+                    "Expected the pending re-bootstrap to be skipped once "
+                    "the connection was up");
+
+        TEST_SAY("Awaiting a (slow) metadata response\n");
+        /* Delayed responses are serialized on the connection: this one waits
+         * for the "connected" refresh's delay, then its own. */
+        err = rd_kafka_metadata(rk, 0, NULL, &md, 3 * metadata_rtt_ms + 10000);
+        TEST_ASSERT(!err, "Metadata after recovery failed: %s",
+                    rd_kafka_err2str(err));
+        rd_kafka_metadata_destroy(md);
+
+        /* No sequence may have run on the healthy connection. */
+        cnt = rd_atomic32_get(&do_test_recovery_skips_sequence_cnt);
+        TEST_ASSERT(cnt == sequences_before,
+                    "Expected no re-bootstrap sequence after recovery, "
+                    "got %d",
+                    cnt - sequences_before);
+
+        /* Await the bootstrap broker's decommission, as above. */
+        cnt = do_test_rebootstrap_backoff_await(
+            rk, &do_test_recovery_skips_bootstrap_gone_cnt,
+            bootstrap_gone_before + 1, 10000);
+        TEST_ASSERT(cnt >= bootstrap_gone_before + 1,
+                    "Expected the bootstrap broker to be decommissioned "
+                    "after recovery");
+        rd_usleep(100 * 1000, 0);
+
+        /* Wait for the learned broker's connection, so that setting the
+         * broker down drops it and reaches "all brokers down" at once. */
+        cnt = do_test_rebootstrap_backoff_await(
+            rk, &do_test_recovery_skips_learned_up_cnt, learned_up_before + 1,
+            10000);
+        TEST_ASSERT(cnt >= learned_up_before + 1,
+                    "Expected the learned broker to come up after recovery");
+
+        /* The backoff starts over once no re-bootstrap has been due for
+         * `reconnect.backoff.max.ms`. */
+        abs_timeout_us = last_due_us + (backoff_max_ms + 500) * 1000LL;
+        while (test_clock() < abs_timeout_us)
+                rd_kafka_poll(rk, 100);
+
+        TEST_SAY("Setting the broker down again\n");
+        sequences_before =
+            rd_atomic32_get(&do_test_recovery_skips_sequence_cnt);
+        rd_atomic32_set(&do_test_recovery_skips_last_delay_ms, 0);
+        TEST_ASSERT(rd_kafka_mock_broker_set_down(cluster, 1) == 0,
+                    "Failed to set broker down");
+        cnt = do_test_rebootstrap_backoff_await(
+            rk, &do_test_recovery_skips_sequence_cnt, sequences_before + 1,
+            15000);
+        TEST_ASSERT(cnt >= sequences_before + 1,
+                    "Expected a re-bootstrap sequence at once in the second "
+                    "outage");
+        delay_ms = rd_atomic32_get(&do_test_recovery_skips_last_delay_ms);
+        TEST_SAY("Re-bootstrap %d set a backoff of %dms\n", cnt, delay_ms);
+        /* The backoff started over: the delay is in the initial range again,
+         * not a doubled one. */
+        TEST_ASSERT(delay_ms >= backoff_ms * 3 / 4 &&
+                        delay_ms <= backoff_ms * 3 / 2,
+                    "Expected the backoff to start over: a delay of "
+                    "%d..%dms, got %d",
+                    backoff_ms * 3 / 4, backoff_ms * 3 / 2, delay_ms);
+
+        rd_kafka_destroy(rk);
+        test_mock_cluster_destroy(cluster);
+        rd_free(log_interceptor);
+        log_interceptor = NULL;
+
+        SUB_TEST_PASS();
+}
+
+/** Counters for do_test_unreachable_learned_broker_backoff(). */
+#define DO_TEST_UNREACHABLE_LEARNED_MAX_DELAYS 8
+/** Backoff delays (ms) set by the all-brokers-down re-bootstraps, in order,
+ *  parsed from the "next re-bootstrap not before <N>ms" debug line. */
+static int do_test_unreachable_learned_delays_ms
+    [DO_TEST_UNREACHABLE_LEARNED_MAX_DELAYS];
+static rd_atomic32_t do_test_unreachable_learned_delay_cnt;
+/** Times the bootstrap broker reached the UP state. */
+static rd_atomic32_t do_test_unreachable_learned_bootstrap_up_cnt;
+
+static void do_test_unreachable_learned_log_cb(const rd_kafka_t *rk,
+                                               int level,
+                                               const char *fac,
+                                               const char *buf) {
+        static const char delay_prefix[] = "next re-bootstrap not before ";
+        const char *delay_str;
+        int delay_ms;
+
+        if ((delay_str = strstr(buf, delay_prefix)) &&
+            sscanf(delay_str + strlen(delay_prefix), "%dms", &delay_ms) ==
+                1) {
+                int idx = rd_atomic32_add(
+                              &do_test_unreachable_learned_delay_cnt, 1) -
+                          1;
+                if (idx < DO_TEST_UNREACHABLE_LEARNED_MAX_DELAYS)
+                        do_test_unreachable_learned_delays_ms[idx] = delay_ms;
+        } else if (strstr(buf, "/bootstrap: Broker changed state") &&
+                   strstr(buf, "-> UP")) {
+                rd_atomic32_add(&do_test_unreachable_learned_bootstrap_up_cnt,
+                                1);
+        }
+}
+
+/**
+ * @brief The re-bootstrap backoff must keep ramping while the bootstrap
+ *        broker connects but the learned broker can't be reached.
+ *
+ * The mock broker advertises the address of a second mock cluster whose
+ * responses are delayed past `socket.connection.setup.timeout.ms`, so a
+ * connection to the learned broker is accepted and then fails by timeout,
+ * on every platform. Each re-bootstrap sequence then goes: bootstrap broker
+ * up, Metadata, learned broker fails, all brokers down. A broker coming up
+ * doesn't reset the backoff, only an idle period longer than
+ * `reconnect.backoff.max.ms` does, so the delays must double; a reset on
+ * the bootstrap broker coming up would keep them in the initial range.
+ */
+static void do_test_unreachable_learned_broker_backoff(void) {
+        rd_kafka_mock_cluster_t *cluster, *unreachable;
+        const char *bootstraps, *unreachable_bootstraps, *colon;
+        const char *debug_contexts[3] = {"generic", "broker", NULL};
+        char unreachable_host[128];
+        int unreachable_port;
+        rd_kafka_conf_t *conf;
+        rd_kafka_t *rk;
+        rd_kafka_resp_err_t err;
+        const int backoff_ms         = 100;
+        const int backoff_max_ms     = 10000;
+        const int expected_delay_cnt = 4;
+        int64_t abs_timeout_us;
+        int32_t delay_cnt, up_cnt;
+        int expected_ms, i;
+
+        SUB_TEST_QUICK();
+
+        rd_atomic32_init(&do_test_unreachable_learned_delay_cnt, 0);
+        rd_atomic32_init(&do_test_unreachable_learned_bootstrap_up_cnt, 0);
+
+        cluster     = test_mock_cluster_new(1, &bootstraps);
+        unreachable = test_mock_cluster_new(1, &unreachable_bootstraps);
+        /* Every response of this broker, ApiVersion included, is delayed
+         * past the connection setup timeout set below. */
+        err = rd_kafka_mock_broker_set_rtt(unreachable, 1, 60 * 1000);
+        TEST_ASSERT(!err, "Failed to set the broker rtt: %s",
+                    rd_kafka_err2str(err));
+
+        colon = strrchr(unreachable_bootstraps, ':');
+        TEST_ASSERT(colon != NULL, "Unexpected bootstrap servers: %s",
+                    unreachable_bootstraps);
+        rd_snprintf(unreachable_host, sizeof(unreachable_host), "%.*s",
+                    (int)(colon - unreachable_bootstraps),
+                    unreachable_bootstraps);
+        unreachable_port = atoi(colon + 1);
+        /* Broker 1 advertises the unreachable address: the bootstrap
+         * connection works, the learned one never does. */
+        rd_kafka_mock_broker_set_host_port(cluster, 1, unreachable_host,
+                                           unreachable_port);
+
+        test_conf_init(&conf, NULL, 90);
+        test_conf_set(conf, "bootstrap.servers", bootstraps);
+        test_conf_set(conf, "reconnect.backoff.ms",
+                      tsprintf("%d", backoff_ms));
+        test_conf_set(conf, "reconnect.backoff.max.ms",
+                      tsprintf("%d", backoff_max_ms));
+        /* Bound how long a connection to the learned broker takes to fail. */
+        test_conf_set(conf, "socket.connection.setup.timeout.ms", "1000");
+        log_interceptor = test_conf_set_log_interceptor(
+            conf, do_test_unreachable_learned_log_cb, debug_contexts);
+        rd_kafka_conf_set_error_cb(conf, do_test_rebootstrap_backoff_error_cb);
+        rk = test_create_handle(RD_KAFKA_PRODUCER, conf);
+
+        TEST_SAY("Awaiting %d all-brokers-down re-bootstraps\n",
+                 expected_delay_cnt);
+        abs_timeout_us = test_clock() + 60 * 1000000LL;
+        while (rd_atomic32_get(&do_test_unreachable_learned_delay_cnt) <
+                   expected_delay_cnt &&
+               test_clock() < abs_timeout_us)
+                rd_kafka_poll(rk, 100);
+
+        delay_cnt =
+            RD_MIN(rd_atomic32_get(&do_test_unreachable_learned_delay_cnt),
+                   DO_TEST_UNREACHABLE_LEARNED_MAX_DELAYS);
+        up_cnt =
+            rd_atomic32_get(&do_test_unreachable_learned_bootstrap_up_cnt);
+        TEST_SAY("%d re-bootstrap(s) scheduled, bootstrap broker up %d "
+                 "time(s)\n",
+                 delay_cnt, up_cnt);
+        TEST_ASSERT(delay_cnt >= expected_delay_cnt,
+                    "Expected at least %d all-brokers-down re-bootstraps, "
+                    "got %d",
+                    expected_delay_cnt, delay_cnt);
+        /* The bootstrap broker came up before every one of them: that is
+         * what must not reset the backoff. */
+        TEST_ASSERT(up_cnt >= expected_delay_cnt,
+                    "Expected the bootstrap broker to come up at least %d "
+                    "times, got %d",
+                    expected_delay_cnt, up_cnt);
+
+        expected_ms = backoff_ms;
+        for (i = 0; i < delay_cnt; i++) {
+                int delay_ms = do_test_unreachable_learned_delays_ms[i];
+                int min_ms   = expected_ms * 3 / 4;
+                int max_ms   = RD_MIN(expected_ms * 3 / 2, backoff_max_ms);
+
+                TEST_SAY("Re-bootstrap %d set a backoff of %dms, "
+                         "expected %d..%dms\n",
+                         i + 1, delay_ms, min_ms, max_ms);
+                TEST_ASSERT(delay_ms >= min_ms && delay_ms <= max_ms,
+                            "Re-bootstrap %d set a backoff of %dms, expected "
+                            "%d..%dms: the backoff was reset by the "
+                            "bootstrap broker coming up",
+                            i + 1, delay_ms, min_ms, max_ms);
+                expected_ms = RD_MIN(expected_ms * 2, backoff_max_ms);
+        }
+
+        rd_kafka_destroy(rk);
+        test_mock_cluster_destroy(unreachable);
+        test_mock_cluster_destroy(cluster);
+        rd_free(log_interceptor);
+        log_interceptor = NULL;
+
+        SUB_TEST_PASS();
+}
+
 /**
  * @brief Test for the mock cluster to ensure there are no problems with
  *        other tests in case they're adding a broker with the same id
@@ -1655,6 +2085,10 @@ int main_0151_purge_brokers_mock(int argc, char **argv) {
         do_test_down_then_up_no_rebootstrap_loop(5);
 
         do_test_down_then_up_no_rebootstrap_loop(15);
+
+        do_test_recovery_skips_pending_rebootstrap();
+
+        do_test_unreachable_learned_broker_backoff();
 
         do_test_kip899_rebootstrap_cases_variations();
 
