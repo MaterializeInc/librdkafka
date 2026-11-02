@@ -704,6 +704,15 @@ struct rd_kafka_s {
          *  Will add bootstrap brokers again
          *  when it's fired. */
         rd_kafka_timer_t rebootstrap_tmr;
+        /** All-brokers-down re-bootstrap timer: armed with no delay by the
+         *  broker thread that takes the last broker down, its callback
+         *  applies the backoff below on the main thread. */
+        rd_kafka_timer_t rebootstrap_backoff_tmr;
+        /** Earliest time the next all-brokers-down re-bootstrap may run,
+         *  and the backoff (ms) to apply after it, doubling up to
+         *  reconnect.backoff.max.ms. Main thread only. */
+        rd_ts_t rk_rebootstrap_backoff_not_before;
+        int rk_rebootstrap_backoff_ms;
 
         thrd_t rk_thread;
 
@@ -1437,6 +1446,7 @@ rd_kafka_resp_err_t rd_kafka_background_thread_create(rd_kafka_t *rk,
                                                       size_t errstr_size);
 
 void rd_kafka_rebootstrap(rd_kafka_t *rk);
+void rd_kafka_rebootstrap_all_brokers_down(rd_kafka_t *rk);
 
 void rd_kafka_rebootstrap_tmr_start_maybe(rd_kafka_t *rk);
 

@@ -394,6 +394,7 @@ rd_bool_t rd_kafka_broker_ApiVersion_at_least_no_lock(rd_kafka_broker_t *rkb,
 void rd_kafka_broker_set_state(rd_kafka_broker_t *rkb, int state) {
         rd_bool_t trigger_monitors               = rd_false,
                   reset_any_broker_down_reported = rd_false,
+                  all_brokers_down               = rd_false,
                   skip_broker_down               = rkb->rkb_c.skip_broker_down;
 
         if ((int)rkb->rkb_state == state)
@@ -423,7 +424,7 @@ void rd_kafka_broker_set_state(rd_kafka_broker_t *rkb, int state) {
                             rd_atomic32_get(
                                 &rkb->rkb_rk->rk_logical_broker_cnt) &&
                     !rd_kafka_terminating(rkb->rkb_rk)) {
-                        rd_kafka_rebootstrap(rkb->rkb_rk);
+                        all_brokers_down = rd_true;
 
                         rd_ts_t now = rd_clock();
                         rd_ts_t rk_last_all_brokers_down_reported_ts =
@@ -508,6 +509,12 @@ void rd_kafka_broker_set_state(rd_kafka_broker_t *rkb, int state) {
                     rd_atomic32_get(&rkb->rkb_persistconn.coord) > 0)
                         trigger_monitors = rd_true;
         }
+
+        /* Asked for after the rk_broker_up_cnt update above: the last broker
+         * usually goes Up -> Down, and the main thread must not see it as
+         * still up when it decides whether to re-bootstrap. */
+        if (all_brokers_down)
+                rd_kafka_rebootstrap_all_brokers_down(rkb->rkb_rk);
 
         rkb->rkb_state    = state;
         rkb->rkb_ts_state = rd_clock();
@@ -5167,17 +5174,36 @@ static int rd_kafka_broker_thread_main(void *arg) {
 
         rd_dassert(rkb->rkb_state == RD_KAFKA_BROKER_STATE_DOWN);
         if (rkb->rkb_source != RD_KAFKA_INTERNAL) {
-                rd_kafka_wrlock(rkb->rkb_rk);
-                TAILQ_REMOVE(&rkb->rkb_rk->rk_brokers, rkb, rkb_link);
+                rd_kafka_t *rk = rkb->rkb_rk;
+                int remaining_cnt;
+                rd_bool_t all_brokers_down;
+
+                rd_kafka_wrlock(rk);
+                TAILQ_REMOVE(&rk->rk_brokers, rkb, rkb_link);
 
                 if (RD_KAFKA_BROKER_IS_LOGICAL(rkb)) {
-                        rd_atomic32_sub(&rkb->rkb_rk->rk_logical_broker_cnt, 1);
+                        rd_atomic32_sub(&rk->rk_logical_broker_cnt, 1);
                 } else if (rd_atomic32_set(&rkb->rkb_down_reported, 0) == 1) {
                         /* Only 1 -> 0 */
-                        rd_atomic32_sub(&rkb->rkb_rk->rk_broker_down_cnt, 1);
+                        rd_atomic32_sub(&rk->rk_broker_down_cnt, 1);
                 }
-                rd_atomic32_sub(&rkb->rkb_rk->rk_broker_cnt, 1);
-                rd_kafka_wrunlock(rkb->rkb_rk);
+                rd_atomic32_sub(&rk->rk_broker_cnt, 1);
+
+                /* A broker that was never reported down, e.g. one being
+                 * decommissioned, kept the all-brokers-down condition from
+                 * holding while the others failed and were latched as
+                 * reported. Now that it is gone, re-check the condition:
+                 * nothing else would, the remaining brokers only report
+                 * their first failure. */
+                remaining_cnt = rd_atomic32_get(&rk->rk_broker_cnt) -
+                                rd_atomic32_get(&rk->rk_logical_broker_cnt);
+                all_brokers_down =
+                    remaining_cnt > 0 &&
+                    rd_atomic32_get(&rk->rk_broker_down_cnt) == remaining_cnt;
+                rd_kafka_wrunlock(rk);
+
+                if (all_brokers_down && !rd_kafka_terminating(rk))
+                        rd_kafka_rebootstrap_all_brokers_down(rk);
         }
 
 #if WITH_SSL

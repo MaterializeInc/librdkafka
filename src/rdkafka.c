@@ -2260,6 +2260,15 @@ static void rd_kafka_rebootstrap_tmr_cb(rd_kafka_timers_t *rkts, void *arg) {
         rd_kafka_dbg(rk, ALL, "REBOOTSTRAP", "Starting re-bootstrap sequence");
 
         rd_atomic32_set(&rk->rk_rebootstrap_in_progress, 1);
+
+        /* Stop any other pending re-bootstrap: this sequence supersedes it,
+         * and its firing later would decommission the brokers re-added
+         * below. Stopping the timer that fired this callback is a no-op. */
+        rd_kafka_timer_stop(&rk->rk_timers, &rk->rebootstrap_backoff_tmr,
+                            rd_true /* lock */);
+        rd_kafka_timer_stop(&rk->rk_timers, &rk->rebootstrap_tmr,
+                            rd_true /* lock */);
+
         rd_kafka_reset_any_broker_down_reported(rk);
 
         /* Decommission the learned and the configured (bootstrap) brokers:
@@ -2334,6 +2343,107 @@ static void rd_kafka_rebootstrap_tmr_cb(rd_kafka_timers_t *rkts, void *arg) {
         rd_list_destroy(&additional_brokerlists);
 done:
         rd_atomic32_set(&rk->rk_rebootstrap_in_progress, 0);
+}
+
+/**
+ * @brief All-brokers-down re-bootstrap timer callback.
+ *
+ * The broker thread that takes the last broker down arms this timer with no
+ * delay, so that the backoff is handled here, on the main thread only: run a
+ * re-bootstrap sequence, unless the previous one ran less than the current
+ * backoff ago, in which case the timer is re-armed for the remaining time,
+ * or a broker connection came up meanwhile, in which case nothing is needed.
+ * The broker counts are updated one at a time by the broker threads, so a
+ * snapshot where every broker is reported down while one still counts as
+ * up is re-checked shortly instead of being acted on.
+ *
+ * The backoff starts at reconnect.backoff.ms with the same -25%..+50% jitter
+ * as the broker reconnect backoff, doubles per consecutive sequence, is
+ * capped at reconnect.backoff.max.ms, and starts over once no re-bootstrap
+ * has been due for longer than reconnect.backoff.max.ms.
+ *
+ * @locality rdkafka main thread
+ * @locks none
+ */
+static void rd_kafka_rebootstrap_backoff_tmr_cb(rd_kafka_timers_t *rkts,
+                                                void *arg) {
+        rd_kafka_t *rk = rkts->rkts_rk;
+        rd_ts_t now    = rd_clock();
+        rd_ts_t backoff_max_us =
+            (rd_ts_t)rk->rk_conf.reconnect_backoff_max_ms * 1000;
+        int backoff_ms, delay_ms;
+
+        if (rd_kafka_terminating(rk))
+                return;
+
+        if (rd_atomic32_get(&rk->rk_broker_up_cnt) > 0) {
+                int remaining_cnt = rd_atomic32_get(&rk->rk_broker_cnt) -
+                                    rd_atomic32_get(&rk->rk_logical_broker_cnt);
+
+                if (remaining_cnt > 0 &&
+                    rd_atomic32_get(&rk->rk_broker_down_cnt) == remaining_cnt) {
+                        /* Every broker is reported down yet one counts as
+                         * up: a broker thread is between the two updates,
+                         * going down (reported first, counted down last) or
+                         * coming up (counted up first, the down reports are
+                         * reset last). Come back once it is done. */
+                        rd_kafka_dbg(rk, ALL, "REBOOTSTRAP",
+                                     "All brokers are reported down but %d "
+                                     "broker connection(s) count as up: "
+                                     "re-checking shortly",
+                                     rd_atomic32_get(&rk->rk_broker_up_cnt));
+                        rd_kafka_timer_start_oneshot(
+                            rkts, &rk->rebootstrap_backoff_tmr,
+                            rd_true /*restart*/, 10 * 1000 /*10ms*/,
+                            rd_kafka_rebootstrap_backoff_tmr_cb, NULL);
+                        return;
+                }
+
+                /* The sequence would only tear that connection down. */
+                rd_kafka_dbg(rk, ALL, "REBOOTSTRAP",
+                             "All brokers were down but a broker connection "
+                             "is up (%d/%d): skipping re-bootstrap",
+                             rd_atomic32_get(&rk->rk_broker_up_cnt),
+                             rd_atomic32_get(&rk->rk_broker_cnt));
+                return;
+        }
+
+        if (rk->rk_rebootstrap_backoff_not_before > now) {
+                rd_ts_t remains = rk->rk_rebootstrap_backoff_not_before - now;
+
+                rd_kafka_dbg(rk, ALL, "REBOOTSTRAP",
+                             "All brokers are down: re-bootstrap in %dms",
+                             (int)(remains / 1000));
+                rd_kafka_timer_start_oneshot(
+                    rkts, &rk->rebootstrap_backoff_tmr, rd_true /*restart*/,
+                    remains, rd_kafka_rebootstrap_backoff_tmr_cb, NULL);
+                return;
+        }
+
+        /* No re-bootstrap has been due for longer than the maximum backoff:
+         * start over from the initial one. */
+        if (rk->rk_rebootstrap_backoff_not_before + backoff_max_us < now)
+                rk->rk_rebootstrap_backoff_ms = 0;
+
+        backoff_ms = rk->rk_rebootstrap_backoff_ms;
+        if (backoff_ms == 0)
+                backoff_ms = rk->rk_conf.reconnect_backoff_ms;
+        delay_ms = rd_jitter((int)((float)backoff_ms * 0.75),
+                             (int)((float)backoff_ms * 1.5));
+        delay_ms = RD_MIN(delay_ms, rk->rk_conf.reconnect_backoff_max_ms);
+
+        rk->rk_rebootstrap_backoff_not_before =
+            now + (rd_ts_t)delay_ms * 1000;
+        rk->rk_rebootstrap_backoff_ms =
+            RD_MIN(backoff_ms * 2, rk->rk_conf.reconnect_backoff_max_ms);
+
+        rd_kafka_dbg(rk, ALL, "REBOOTSTRAP",
+                     "All brokers are down (%d/%d broker(s) up): "
+                     "re-bootstrapping, next re-bootstrap not before %dms",
+                     rd_atomic32_get(&rk->rk_broker_up_cnt),
+                     rd_atomic32_get(&rk->rk_broker_cnt), delay_ms);
+
+        rd_kafka_rebootstrap_tmr_cb(rkts, arg);
 }
 
 static void rd_kafka_stats_emit_tmr_cb(rd_kafka_timers_t *rkts, void *arg) {
@@ -4564,6 +4674,26 @@ void rd_kafka_rebootstrap(rd_kafka_t *rk) {
                     &rk->rk_timers, &rk->rebootstrap_tmr, rd_true /*restart*/,
                     0, rd_kafka_rebootstrap_tmr_cb, NULL);
         }
+}
+
+/**
+ * Schedules a rebootstrap because all brokers are down: arms the
+ * all-brokers-down re-bootstrap timer with no delay, unless it is already
+ * pending. Its callback applies the backoff, on the main thread.
+ *
+ * @locks none
+ * @locks_acquired rd_kafka_timers_lock()
+ * @locality any
+ */
+void rd_kafka_rebootstrap_all_brokers_down(rd_kafka_t *rk) {
+        if (rk->rk_conf.metadata_recovery_strategy ==
+            RD_KAFKA_METADATA_RECOVERY_STRATEGY_NONE)
+                return;
+
+        rd_kafka_timer_start_oneshot(&rk->rk_timers,
+                                     &rk->rebootstrap_backoff_tmr,
+                                     rd_false /*don't restart*/, 0,
+                                     rd_kafka_rebootstrap_backoff_tmr_cb, NULL);
 }
 
 /**
