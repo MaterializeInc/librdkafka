@@ -6796,10 +6796,11 @@ void rd_kafka_brokers_decommission_non_logical(rd_kafka_t *rk,
                  * a kept broker whose name DNS no longer returns stays until
                  * the first successful Metadata response decommissions it. */
                 if (rkb->rkb_source == RD_KAFKA_CONFIGURED) {
-                    rd_kafka_broker_state_t state = rd_kafka_broker_get_state(rkb);
-                    if (state != RD_KAFKA_BROKER_STATE_UP &&
-                        state != RD_KAFKA_BROKER_STATE_REAUTH)
-                        continue;
+                        rd_kafka_broker_state_t state =
+                            rd_kafka_broker_get_state(rkb);
+                        if (state != RD_KAFKA_BROKER_STATE_UP &&
+                            state != RD_KAFKA_BROKER_STATE_REAUTH)
+                                continue;
                 }
 
                 /* Don't try to decommission already decommissioning brokers

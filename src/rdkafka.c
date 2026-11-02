@@ -2298,7 +2298,6 @@ static void rd_kafka_rebootstrap_tmr_cb(rd_kafka_timers_t *rkts, void *arg) {
          * periodic topic scan keeps refreshing metadata from whichever
          * comes up, as the partitions are now delegated to the internal
          * broker.
-
          *
          * Nothing queued on them is lost: the broker termination path
          * hands its partitions back (`PARTITION_LEAVE`, moving the
