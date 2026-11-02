@@ -6772,15 +6772,13 @@ void rd_kafka_brokers_decommission_non_logical(rd_kafka_t *rk,
                      rd_atomic32_get(&rk->rk_broker_cnt), NULL);
 
         TAILQ_FOREACH(rkb, &rk->rk_brokers, rkb_link) {
-                int state;
+                rd_kafka_broker_state_t state;
 
                 if (rkb->rkb_source != RD_KAFKA_LEARNED &&
                     rkb->rkb_source != RD_KAFKA_CONFIGURED)
                         continue;
 
-                rd_kafka_broker_lock(rkb);
-                state = rkb->rkb_state;
-                rd_kafka_broker_unlock(rkb);
+                state = rd_kafka_broker_get_state(rkb);
 
                 /* A bootstrap broker without an established connection has
                  * no stale connection to drop: its connection attempts
