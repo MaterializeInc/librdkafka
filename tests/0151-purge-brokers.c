@@ -718,6 +718,11 @@ static void do_test_add_same_broker_id(void) {
 static rd_atomic32_t do_test_all_brokers_down_backoff_rebootstrap_cnt;
 
 /**
+ * @brief Number of connection attempts (sockets connected) made.
+ */
+static rd_atomic32_t do_test_all_brokers_down_backoff_connect_cnt;
+
+/**
  * @brief Set once broker 1 is learned from a successful Metadata response.
  */
 static rd_atomic32_t do_test_all_brokers_down_backoff_recovered;
@@ -746,6 +751,12 @@ static void do_test_all_brokers_down_backoff_log_cb(const rd_kafka_t *rk,
                 return;
         }
 
+        if (strstr(buf, ": Connecting to ")) {
+                rd_atomic32_add(&do_test_all_brokers_down_backoff_connect_cnt,
+                                1);
+                return;
+        }
+
         if (strstr(buf, "/1: Added new broker with NodeId 1")) {
                 rd_atomic32_set(&do_test_all_brokers_down_backoff_recovered, 1);
                 return;
@@ -769,6 +780,7 @@ static void do_test_all_brokers_down_backoff_reset(void) {
         int i;
 
         rd_atomic32_init(&do_test_all_brokers_down_backoff_rebootstrap_cnt, 0);
+        rd_atomic32_init(&do_test_all_brokers_down_backoff_connect_cnt, 0);
         rd_atomic32_init(&do_test_all_brokers_down_backoff_recovered, 0);
         for (i = 0; i < 2; i++) {
                 *do_test_all_brokers_down_backoff_bootstrap_added[i] = '\0';
@@ -948,26 +960,29 @@ static void do_test_all_brokers_down_backoff_recovery(void) {
 }
 
 /**
- * @brief While every connection to the only bootstrap server is refused,
- *        each failure starts a re-bootstrap sequence. The bootstrap broker
- *        must be kept across those sequences instead of being replaced by a
- *        new broker object on each one.
+ * @brief Measure how often a consumer tries to connect while every connection
+ *        to the only bootstrap server is refused, and check that the bootstrap
+ *        broker is kept across the re-bootstrap sequences each failure starts,
+ *        instead of being replaced by a new broker object on each one.
  *
  *        A refused connection sends the broker back to INIT, where
  *        rd_kafka_connect_any() selects it again with a CONNECT op that skips
- *        the reconnect backoff, so the sequence count isn't bounded here:
- *        only the number of broker objects is.
+ *        the reconnect backoff, so neither the attempt rate nor the sequence
+ *        count is bounded here, only the number of broker objects is. The
+ *        rate is reported for reference, as each attempt may cost work on
+ *        the broker side or in a proxy in front of it: about 18 attempts/s
+ *        were observed for a group consumer.
  *
  *        The mock cluster is destroyed right after its bootstrap address is
  *        copied, so the port is unbound and the connection refused at once
  *        on every platform.
  */
-static void do_test_all_brokers_refused_keeps_bootstrap_broker(void) {
+static void do_test_all_brokers_refused_connect_rate(void) {
         rd_kafka_mock_cluster_t *cluster;
         const char *bootstraps;
         char *bootstraps_copy;
         rd_kafka_t *rk;
-        int32_t rebootstrap_cnt, added_cnt;
+        int32_t connect_cnt, rebootstrap_cnt, added_cnt;
 
         SUB_TEST_QUICK();
 
@@ -984,6 +999,8 @@ static void do_test_all_brokers_refused_keeps_bootstrap_broker(void) {
         rd_free(bootstraps_copy);
 
         rd_sleep(3);
+        connect_cnt =
+            rd_atomic32_get(&do_test_all_brokers_down_backoff_connect_cnt);
         rebootstrap_cnt =
             rd_atomic32_get(&do_test_all_brokers_down_backoff_rebootstrap_cnt);
         added_cnt = rd_atomic32_get(
@@ -991,10 +1008,10 @@ static void do_test_all_brokers_refused_keeps_bootstrap_broker(void) {
 
         do_test_all_brokers_down_backoff_client_destroy(rk);
 
-        TEST_SAY("%" PRId32
+        TEST_SAY("%" PRId32 " connection attempts (%.1f/s) and %" PRId32
                  " re-bootstrap sequences in 3s, bootstrap broker objects "
                  "created: %" PRId32 "\n",
-                 rebootstrap_cnt, added_cnt);
+                 connect_cnt, connect_cnt / 3.0, rebootstrap_cnt, added_cnt);
         TEST_ASSERT(rebootstrap_cnt >= 1,
                     "Expected at least one re-bootstrap sequence while the "
                     "connection is refused, got %" PRId32,
@@ -1949,7 +1966,7 @@ int main_0151_purge_brokers_mock(int argc, char **argv) {
         do_test_all_brokers_down_backoff(RD_KAFKA_CONSUMER);
         do_test_all_brokers_down_backoff(RD_KAFKA_PRODUCER);
         do_test_all_brokers_down_backoff_recovery();
-        do_test_all_brokers_refused_keeps_bootstrap_broker();
+        do_test_all_brokers_refused_connect_rate();
         do_test_rebootstrap_replaces_only_up_bootstrap_brokers();
 
         do_test_kip899_rebootstrap_cases_variations();
