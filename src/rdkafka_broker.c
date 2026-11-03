@@ -6780,9 +6780,10 @@ void rd_kafka_brokers_decommission_non_logical(rd_kafka_t *rk,
                  * reset its reconnect backoff, so with every broker down
                  * each sequence would reconnect after `sparse_connect_intvl`
                  * instead of backing off. A kept broker re-resolves its
-                 * address after `broker.address.ttl`; an attempt already
-                 * reaching a stale cluster gets `REBOOTSTRAP_REQUIRED` once
-                 * UP and the next sequence replaces it. */
+                 * address after `broker.address.ttl`. A connect attempt
+                 * from a kept broker reaching a stale cluster gets
+                 * `REBOOTSTRAP_REQUIRED` once it comes up and it will
+                 * quickly be removed. */
                 if (rkb->rkb_source == RD_KAFKA_CONFIGURED) {
                         rd_kafka_broker_state_t state =
                             rd_kafka_broker_get_state(rkb);
