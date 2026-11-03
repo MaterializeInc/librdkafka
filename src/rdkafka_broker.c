@@ -6743,16 +6743,19 @@ void rd_kafka_brokers_decommission_list(rd_kafka_t *rk, rd_list_t *brokers) {
 }
 
 /**
- * @brief Decommission all learned and configured (bootstrap) brokers,
- *        keeping the logical and internal ones.
+ * @brief Decommission all learned brokers and the configured (bootstrap)
+ *        brokers that are usable (UP or REAUTH), keeping the logical and
+ *        internal ones and the bootstrap brokers that are down or still
+ *        connecting.
  *
- *        Used by the re-bootstrap sequence: the bootstrap brokers are
- *        re-added afterwards as new broker objects, so they're connected
- *        again and their addresses re-resolved, and only they are used
- *        until a Metadata response rebuilds the broker list. Partitions
- *        delegated to the decommissioned brokers are handed back with their
- *        queued messages, see `RD_KAFKA_OP_PARTITION_LEAVE` handling, and
- *        delegated again on the next Metadata response.
+ *        Used by the re-bootstrap sequence: the decommissioned bootstrap
+ *        brokers are re-added afterwards as new broker objects, so they're
+ *        connected again and their addresses re-resolved, and only the
+ *        bootstrap brokers are used until a Metadata response rebuilds the
+ *        broker list. Partitions delegated to the decommissioned brokers are
+ *        handed back with their queued messages, see
+ *        `RD_KAFKA_OP_PARTITION_LEAVE` handling, and delegated again on the
+ *        next Metadata response.
  *
  * @param reason Reason for the decommission, for debug logs.
  *
@@ -6773,6 +6776,21 @@ void rd_kafka_brokers_decommission_non_logical(rd_kafka_t *rk,
                 if (rkb->rkb_source != RD_KAFKA_LEARNED &&
                     rkb->rkb_source != RD_KAFKA_CONFIGURED)
                         continue;
+                /* Replacing a down or connecting bootstrap broker would
+                 * reset its reconnect backoff, so with every broker down
+                 * each sequence would reconnect after `sparse_connect_intvl`
+                 * instead of backing off. A kept broker re-resolves its
+                 * address after `broker.address.ttl`. A connect attempt
+                 * from a kept broker reaching a stale cluster gets
+                 * `REBOOTSTRAP_REQUIRED` once it comes up and it will
+                 * quickly be removed. */
+                if (rkb->rkb_source == RD_KAFKA_CONFIGURED) {
+                        rd_kafka_broker_state_t state =
+                            rd_kafka_broker_get_state(rkb);
+                        if (state != RD_KAFKA_BROKER_STATE_UP &&
+                            state != RD_KAFKA_BROKER_STATE_REAUTH)
+                                continue;
+                }
 
                 /* Don't try to decommission already decommissioning brokers
                  * otherwise they could be already destroyed when

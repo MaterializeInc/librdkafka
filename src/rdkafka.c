@@ -2262,10 +2262,12 @@ static void rd_kafka_rebootstrap_tmr_cb(rd_kafka_timers_t *rkts, void *arg) {
         rd_atomic32_set(&rk->rk_rebootstrap_in_progress, 1);
         rd_kafka_reset_any_broker_down_reported(rk);
 
-        /* Decommission the learned and the configured (bootstrap) brokers:
-         * from now on, until a successful Metadata response rebuilds the
-         * broker list, only the bootstrap brokers re-added below may be
-         * used.
+        /* Decommission the learned brokers and the configured (bootstrap)
+         * brokers that are usable (UP or REAUTH), keeping the bootstrap
+         * brokers that are down or still connecting with their reconnect
+         * backoff, see rd_kafka_brokers_decommission_non_logical(): from
+         * now on, until a successful Metadata response rebuilds the broker
+         * list, only the bootstrap brokers may be used.
          *
          * Re-adding the bootstrap brokers isn't enough on its own:
          *
@@ -2286,12 +2288,16 @@ static void rd_kafka_rebootstrap_tmr_cb(rd_kafka_timers_t *rkts, void *arg) {
          *
          * Decommissioning them takes `rk_broker_up_cnt` to zero and takes
          * them out of every broker lookup (`rd_kafka_broker_find()` and
-         * `rd_kafka_broker_random0()` skip terminating brokers): the
-         * bootstrap brokers are re-added as new, never connected, broker
-         * objects and the usual "no usable brokers" path connects one of
-         * them, resolving its address anew, while the periodic topic scan
-         * keeps refreshing metadata from it, as the partitions are now
-         * delegated to the internal broker.
+         * `rd_kafka_broker_random0()` skip terminating brokers). The
+         * decommissioned bootstrap brokers are re-added as new, never
+         * connected, broker objects; the kept ones are found again by
+         * `rd_kafka_find_or_add_broker()`. The usual "no usable brokers"
+         * path then connects a broker in INIT, a new object or a kept one
+         * without connection demand, resolving its address anew, while a
+         * kept broker in TRY_CONNECT reconnects on its own backoff. The
+         * periodic topic scan keeps refreshing metadata from whichever
+         * comes up, as the partitions are now delegated to the internal
+         * broker.
          *
          * Nothing queued on them is lost: the broker termination path
          * hands its partitions back (`PARTITION_LEAVE`, moving the
