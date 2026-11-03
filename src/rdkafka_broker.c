@@ -6776,26 +6776,13 @@ void rd_kafka_brokers_decommission_non_logical(rd_kafka_t *rk,
                 if (rkb->rkb_source != RD_KAFKA_LEARNED &&
                     rkb->rkb_source != RD_KAFKA_CONFIGURED)
                         continue;
-                /* Keep a bootstrap broker that isn't UP or REAUTH: replacing
-                 * it would reset its reconnect backoff. When all brokers are
-                 * down, every failed attempt starts a new re-bootstrap
-                 * sequence, so a new broker object would connect again after
-                 * `sparse_connect_intvl` instead of backing off up to
-                 * `reconnect.backoff.max.ms`.
-                 *
-                 * Its address is re-resolved once `broker.address.ttl` has
-                 * passed. An attempt in progress may already hold a socket
-                 * to the previously resolved address: if that is a stale
-                 * cluster, the broker gets `REBOOTSTRAP_REQUIRED` once UP
-                 * and the next sequence replaces it.
-                 *
-                 * The backoff only survives while the broker wants a
-                 * connection: a broker back in INIT is selected by
-                 * rd_kafka_connect_any(), whose CONNECT op skips the
-                 * backoff. It is found again when the bootstrap servers are
-                 * re-added. With `resolve_canonical_bootstrap_servers_only`,
-                 * a kept broker whose name DNS no longer returns stays until
-                 * the first successful Metadata response decommissions it. */
+                /* Replacing a down or connecting bootstrap broker would
+                 * reset its reconnect backoff, so with every broker down
+                 * each sequence would reconnect after `sparse_connect_intvl`
+                 * instead of backing off. A kept broker re-resolves its
+                 * address after `broker.address.ttl`; an attempt already
+                 * reaching a stale cluster gets `REBOOTSTRAP_REQUIRED` once
+                 * UP and the next sequence replaces it. */
                 if (rkb->rkb_source == RD_KAFKA_CONFIGURED) {
                         rd_kafka_broker_state_t state =
                             rd_kafka_broker_get_state(rkb);
