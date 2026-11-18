@@ -17,6 +17,17 @@
   build without external dependencies.
   Happening since 2.16.0 (#5631, @GBNikola).
 
+* Issues: #5665.
+  While all brokers were down, each re-bootstrap sequence replaced the
+  bootstrap brokers with new broker objects, resetting their reconnect
+  backoff: the client reconnected to a bootstrap server that closed its
+  connections about every `reconnect.backoff.ms / 2` for the whole outage,
+  never backing off up to `reconnect.backoff.max.ms`.
+  A re-bootstrap sequence now replaces only the bootstrap brokers that are
+  up, and keeps the ones that are down or still connecting, together with
+  their reconnect backoff.
+  Happening since 2.16.0 (@peterdukelarsen).
+
 ### Producer fixes
 
 * Reject malformed Produce response record-error counts before allocating
