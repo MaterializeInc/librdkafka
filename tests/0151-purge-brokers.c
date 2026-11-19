@@ -1111,6 +1111,141 @@ static void do_test_rebootstrap_replaces_only_up_bootstrap_brokers(void) {
         SUB_TEST_PASS();
 }
 
+/**
+ * @brief Port that refuses connections, returned as the first address by
+ *        do_test_unreachable_address_no_rebootstrap_resolve_cb().
+ */
+static int do_test_unreachable_address_no_rebootstrap_closed_port;
+
+/**
+ * @brief Resolve every broker to two loopback addresses, one on a port that
+ *        refuses connections and one on the requested port.
+ */
+static int do_test_unreachable_address_no_rebootstrap_resolve_cb(
+    const char *node,
+    const char *service,
+    const struct addrinfo *hints,
+    struct addrinfo **res,
+    void *opaque) {
+        struct addrinfo *ai, *next;
+        int i;
+
+        if (!node) {
+                for (ai = *res; ai; ai = next) {
+                        next = ai->ai_next;
+                        free(ai->ai_addr);
+                        free(ai);
+                }
+                return 0;
+        }
+
+        *res = NULL;
+        for (i = 0; i < 2; i++) {
+                struct sockaddr_in *addr = calloc(1, sizeof(*addr));
+
+                addr->sin_family = AF_INET;
+                addr->sin_port   = htons(
+                    i ? do_test_unreachable_address_no_rebootstrap_closed_port
+                      : atoi(service));
+                addr->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+                ai              = calloc(1, sizeof(*ai));
+                ai->ai_family   = AF_INET;
+                ai->ai_socktype = SOCK_STREAM;
+                ai->ai_protocol = IPPROTO_TCP;
+                ai->ai_addrlen  = sizeof(*addr);
+                ai->ai_addr     = (struct sockaddr *)addr;
+                ai->ai_next     = *res;
+                *res            = ai;
+        }
+        return 0;
+}
+
+/**
+ * @brief A broker with an unreachable address isn't down until its other
+ *        addresses were tried, so it doesn't start a re-bootstrap sequence.
+ *
+ *        The resolved addresses are shuffled, so half of the brokers try the
+ *        unreachable one first. A sequence started by the only learned broker
+ *        decommissions it and fails the ListOffsets request queued on it
+ *        with `_DESTROY_BROKER`. Ten clients make it unlikely (4^-10) that
+ *        none of their two brokers starts with the unreachable address.
+ *
+ * @param address_ttl `broker.address.ttl`. With 0 the addresses would be
+ *                    resolved and shuffled again before each attempt, and
+ *                    the second one could try the unreachable address again.
+ */
+static void
+do_test_unreachable_address_no_rebootstrap(const char *address_ttl) {
+        const char *debug_contexts[3] = {"generic", "broker", NULL};
+        rd_kafka_mock_cluster_t *cluster, *closed_cluster;
+        const char *bootstraps, *closed_bootstraps;
+        const int client_cnt          = 10;
+        int32_t rebootstrap_cnt, connect_cnt;
+        int i;
+
+        SUB_TEST_QUICK("broker.address.ttl=%s", address_ttl);
+
+        do_test_all_brokers_down_backoff_reset();
+
+        /* A destroyed mock cluster leaves a port that refuses connections. */
+        closed_cluster = test_mock_cluster_new(1, &closed_bootstraps);
+        do_test_unreachable_address_no_rebootstrap_closed_port =
+            atoi(strrchr(closed_bootstraps, ':') + 1);
+        test_mock_cluster_destroy(closed_cluster);
+
+        cluster = test_mock_cluster_new(1, &bootstraps);
+        TEST_CALL_ERR__(rd_kafka_mock_topic_create(cluster, "topic", 1, 1));
+
+        for (i = 0; i < client_cnt; i++) {
+                rd_kafka_topic_partition_list_t *offsets;
+                rd_kafka_resp_err_t err;
+                rd_kafka_conf_t *conf;
+                rd_kafka_t *rk;
+
+                test_conf_init(&conf, NULL, 30);
+                test_conf_set(conf, "bootstrap.servers", bootstraps);
+                test_conf_set(conf, "broker.address.ttl", address_ttl);
+                rd_kafka_conf_set_resolve_cb(
+                    conf,
+                    do_test_unreachable_address_no_rebootstrap_resolve_cb);
+                log_interceptor = test_conf_set_log_interceptor(
+                    conf, do_test_all_brokers_down_backoff_log_cb,
+                    debug_contexts);
+                rk = test_create_handle(RD_KAFKA_CONSUMER, conf);
+
+                offsets = rd_kafka_topic_partition_list_new(1);
+                rd_kafka_topic_partition_list_add(offsets, "topic", 0)->offset =
+                    1;
+                err = rd_kafka_offsets_for_times(rk, offsets, 10 * 1000);
+                rd_kafka_topic_partition_list_destroy(offsets);
+
+                rd_kafka_destroy(rk);
+                rd_free(log_interceptor);
+                log_interceptor = NULL;
+
+                TEST_ASSERT(!err, "Client %d: expected the offsets, got %s", i,
+                            rd_kafka_err2name(err));
+        }
+
+        rebootstrap_cnt =
+            rd_atomic32_get(&do_test_all_brokers_down_backoff_rebootstrap_cnt);
+        connect_cnt =
+            rd_atomic32_get(&do_test_all_brokers_down_backoff_connect_cnt);
+        test_mock_cluster_destroy(cluster);
+
+        /* Each client connects a bootstrap and a learned broker. */
+        TEST_ASSERT(connect_cnt > 2 * client_cnt,
+                    "Expected a connection attempt to the unreachable "
+                    "address, got %" PRId32 " attempts by %d clients",
+                    connect_cnt, client_cnt);
+        TEST_ASSERT(rebootstrap_cnt == 0,
+                    "Expected no re-bootstrap sequence, got %" PRId32,
+                    rebootstrap_cnt);
+
+        SUB_TEST_PASS();
+}
+
 typedef enum do_test_kip899_rebootstrap_cases_variation_t {
         /* re-bootstrap is enabled and triggered. */
         DO_TEST_KIP899_REBOOTSTRAP_CASES_VARIATION_REBOOTSTRAP_ENABLED = 0,
@@ -1968,6 +2103,8 @@ int main_0151_purge_brokers_mock(int argc, char **argv) {
         do_test_all_brokers_down_backoff_recovery();
         do_test_all_brokers_refused_connect_rate();
         do_test_rebootstrap_replaces_only_up_bootstrap_brokers();
+        do_test_unreachable_address_no_rebootstrap("1000");
+        do_test_unreachable_address_no_rebootstrap("0");
 
         do_test_kip899_rebootstrap_cases_variations();
 
