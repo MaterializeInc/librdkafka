@@ -383,6 +383,18 @@ rd_bool_t rd_kafka_broker_ApiVersion_at_least_no_lock(rd_kafka_broker_t *rkb,
 }
 
 /**
+ * @returns true if a connection attempt failed since the broker was last up
+ *          and some of its resolved addresses were not tried since.
+ *
+ * @locality broker thread
+ */
+static rd_bool_t
+rd_kafka_broker_has_untried_addresses(const rd_kafka_broker_t *rkb) {
+        return rkb->rkb_rsal && rkb->rkb_connect_fail_cnt > 0 &&
+               rkb->rkb_connect_fail_cnt < rkb->rkb_rsal->rsal_cnt;
+}
+
+/**
  * @brief Set broker state.
  *
  *        \c rkb->rkb_state is the previous state, while
@@ -394,7 +406,8 @@ rd_bool_t rd_kafka_broker_ApiVersion_at_least_no_lock(rd_kafka_broker_t *rkb,
 void rd_kafka_broker_set_state(rd_kafka_broker_t *rkb, int state) {
         rd_bool_t trigger_monitors               = rd_false,
                   reset_any_broker_down_reported = rd_false,
-                  skip_broker_down               = rkb->rkb_c.skip_broker_down;
+                  skip_broker_down               = rkb->rkb_c.skip_broker_down,
+                  untried_addresses              = rd_false;
 
         if ((int)rkb->rkb_state == state)
                 return;
@@ -409,10 +422,30 @@ void rd_kafka_broker_set_state(rd_kafka_broker_t *rkb, int state) {
                  * treated as a planned disconnection. */
                 rkb->rkb_c.skip_broker_down = rd_false;
 
+        if (rd_kafka_broker_state_is_up(state)) {
+                rkb->rkb_connect_fail_cnt = 0;
+        } else if (rd_kafka_broker_state_is_down(state) && !skip_broker_down &&
+                   rkb->rkb_rsal && !rkb->rkb_reauth_in_progress &&
+                   rkb->rkb_state >= RD_KAFKA_BROKER_STATE_CONNECT &&
+                   rkb->rkb_state != RD_KAFKA_BROKER_STATE_UP &&
+                   rkb->rkb_state != RD_KAFKA_BROKER_STATE_REAUTH) {
+                /* A connection attempt failed. The first time since the
+                 * broker was up, it is not down until one failed for each of
+                 * its addresses: reporting it earlier lets a single
+                 * unreachable address of the only known broker start a
+                 * re-bootstrap sequence, that decommissions the broker and
+                 * fails the requests queued on it. After that every failed
+                 * attempt reports it down, until it comes up again. */
+                if (rkb->rkb_connect_fail_cnt < rkb->rkb_rsal->rsal_cnt)
+                        rkb->rkb_connect_fail_cnt++;
+                untried_addresses = rd_kafka_broker_has_untried_addresses(rkb);
+        }
+
         if (rkb->rkb_source == RD_KAFKA_INTERNAL ||
             RD_KAFKA_BROKER_IS_LOGICAL(rkb)) {
                 /* no-op */
         } else if (rd_kafka_broker_state_is_down(state) && !skip_broker_down &&
+                   !untried_addresses &&
                    /* Only 0 -> 1 */
                    rd_atomic32_set(&rkb->rkb_down_reported, 1) == 0) {
 
@@ -725,8 +758,6 @@ void rd_kafka_broker_fail(rd_kafka_broker_t *rkb,
                 rkb->rkb_recv_buf = NULL;
         }
 
-        rkb->rkb_reauth_in_progress = rd_false;
-
         va_start(ap, fmt);
         rd_kafka_broker_set_error(rkb, level, err, fmt, ap);
         va_end(ap);
@@ -741,9 +772,11 @@ void rd_kafka_broker_fail(rd_kafka_broker_t *rkb,
                 rd_kafka_broker_feature_disable(rkb,
                                                 RD_KAFKA_FEATURE_APIVERSION);
 
-        /* Set broker state */
+        /* Set broker state.
+         * NOTE: rd_kafka_broker_set_state() reads the reauth flag. */
         old_state = rkb->rkb_state;
         rd_kafka_broker_set_state(rkb, RD_KAFKA_BROKER_STATE_DOWN);
+        rkb->rkb_reauth_in_progress = rd_false;
 
         /* Stop any pending reauth timer, since a teardown/reconnect will
          * require a new timer. */
@@ -1195,11 +1228,17 @@ static int rd_kafka_broker_resolve(rd_kafka_broker_t *rkb,
                 return -1;
         }
 
+        if (reset_cached_addr)
+                rkb->rkb_connect_fail_cnt = 0;
+
+        /* NOTE: A resolved list is shuffled, so replacing it before each of
+         * its addresses was tried could try the same address again. */
         if (rkb->rkb_rsal &&
             (reset_cached_addr ||
-             rkb->rkb_ts_rsal_last +
-                     (rkb->rkb_rk->rk_conf.broker_addr_ttl * 1000) <
-                 rd_clock())) {
+             (!rd_kafka_broker_has_untried_addresses(rkb) &&
+              rkb->rkb_ts_rsal_last +
+                      (rkb->rkb_rk->rk_conf.broker_addr_ttl * 1000) <
+                  rd_clock()))) {
                 /* Address list has expired. */
 
                 /* Save the address index to make sure we still round-robin
@@ -4981,7 +5020,16 @@ static int rd_kafka_broker_thread_main(void *arg) {
 
                 case RD_KAFKA_BROKER_STATE_DOWN:
                         rd_kafka_broker_lock(rkb);
-                        if (rkb->rkb_rk->rk_conf.sparse_connections)
+                        if (rd_kafka_broker_has_untried_addresses(rkb)) {
+                                /* Try the next address at once, the
+                                 * reconnect backoff applies again when
+                                 * all of them failed.
+                                 * NOTE: 0 would also reset the exponential
+                                 * backoff on the next attempt. */
+                                rkb->rkb_ts_reconnect = rd_clock();
+                                rd_kafka_broker_set_state(
+                                    rkb, RD_KAFKA_BROKER_STATE_TRY_CONNECT);
+                        } else if (rkb->rkb_rk->rk_conf.sparse_connections)
                                 rd_kafka_broker_set_state(
                                     rkb, RD_KAFKA_BROKER_STATE_INIT);
                         else
